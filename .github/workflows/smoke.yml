@@ -41,6 +41,9 @@ jobs:
         run: |
           set -euo pipefail
           work="$(mktemp -d)"
+          # macOS: mktemp returns /var/... but /var is a symlink to /private/var.
+          # `am` reports the physical path, so normalize before comparing.
+          work="$(cd "$work" && pwd -P)"
           cd "$work"
           am --version
           am init --project onpath >/dev/null
