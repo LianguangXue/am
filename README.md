@@ -1,5 +1,7 @@
 # am — one memory for all your coding agents
 
+[![smoke](https://github.com/LianguangXue/am/actions/workflows/smoke.yml/badge.svg)](https://github.com/LianguangXue/am/actions/workflows/smoke.yml)
+
 `claude-code`, `codex` and `dsh` write to **one store on disk**. When one runs out
 of quota or dies mid-task, the next picks up from the artifacts instead of from
 scratch — and when the first comes back, it continues from whatever the second
@@ -194,6 +196,20 @@ am doctor
 [`docs/USAGE.md`](docs/USAGE.md)。
 
 ---
+
+## Tests
+
+```bash
+bash tests/smoke.sh            # end-to-end, against a throwaway store
+python3 tests/stdlib_only.py   # the core tool must not import outside stdlib
+```
+
+`tests/smoke.sh` builds a store in a temp directory and exercises the paths that
+matter: init, goal/task/decision/next, the brief's contents and its
+"data not instruction" fence, `--lang zh`, forced lease takeover, dry-run prune,
+and the dashboard's state endpoint and page shell. CI runs it on Ubuntu and macOS
+against Python 3.10 and 3.12, and additionally runs the installed `am` from
+`PATH`, because that is how agents invoke it.
 
 ## License
 
