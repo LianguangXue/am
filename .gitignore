@@ -1,0 +1,14 @@
+# Store data — never commit. `am init` creates these inside a .agents/ directory.
+.agents/journal/
+.agents/tasks/
+.agents/leases/
+.agents/tail/
+.agents/briefs/
+.agents/idx/
+.agents/archive/
+.agents/state.md
+.agents/hidden.json
+.agents/.watch.json
+.agents/config.json
+__pycache__/
+*.pyc
