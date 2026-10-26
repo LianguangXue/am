@@ -1,0 +1,49 @@
+name: smoke
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: py${{ matrix.python }} · ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install onto PATH
+        run: |
+          ./install.sh
+          # Hosted runners do not put ~/.local/bin on PATH by default.
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: End-to-end smoke test
+        run: bash tests/smoke.sh
+
+      # The tool is run as `am` by agents, from the PATH, so prove that path works
+      # rather than only proving the in-repo copy does.
+      - name: am on PATH resolves the same store
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"
+          cd "$work"
+          am --version
+          am init --project onpath >/dev/null
+          test "$(am where)" = "$work/.agents"   # no pipe: pipefail + grep -q would report SIGPIPE
+          am goal "prove the installed binary works" >/dev/null
+          am doctor >/dev/null
