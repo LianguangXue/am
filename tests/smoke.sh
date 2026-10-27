@@ -33,6 +33,7 @@ python3 -m py_compile "$REPO/bin/am" "$REPO/bin/am-embed.py"
 python3 "$REPO/tests/stdlib_only.py" >/dev/null || {
   python3 "$REPO/tests/stdlib_only.py"; fail "the core tool must stay stdlib-only"; }
 ok "binary runs, byte-compiles and is stdlib-only"
+python3 "$REPO/tests/portability.py"
 
 # ---------------------------------------------------------------- init
 cd "$WORK"
