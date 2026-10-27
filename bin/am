@@ -2536,7 +2536,14 @@ def cmd_serve(am: Path, cfg: dict, args: argparse.Namespace) -> int:
       if not short:
         self.send_error(400)
         return
-      hide_session(am, short, str(body.get("why") or "manual"), state=not body.get("undo"))
+      undo = bool(body.get("undo"))
+      hide_session(am, short, str(body.get("why") or "manual"), state=not undo)
+      print(f"{'restore' if undo else 'hide'} {short} via dashboard", file=sys.stderr)
+      # The snapshot TTL is long enough to make the UI feel stale after a
+      # mutation, so drop it under the same lock the GET path uses.
+      with state_lock:
+        DASHBOARD_CACHE["payload"] = None
+        DASHBOARD_CACHE["at"] = 0.0
       out = json.dumps({"ok": True, "hidden": sorted(hidden_state(am))}).encode("utf-8")
       self.send_response(200)
       self.send_header("Content-Type", "application/json; charset=utf-8")
