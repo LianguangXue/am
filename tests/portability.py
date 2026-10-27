@@ -7,6 +7,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -26,6 +27,22 @@ def command(text: str) -> bytes:
   return (json.dumps({"type": "assistant", "message": {"content": [
     {"type": "tool_use", "name": "Bash", "input": {"command": text}},
   ]}}) + "\n").encode()
+
+
+def isolated_root() -> Path:
+  """Return a temp directory with no `am` store in any ancestor.
+
+  `am` prefers a store found by walking up from the working directory over the
+  `~/.am-root` pointer. A fixture nested inside a real project therefore tests
+  the wrong branch of that rule, and passes or fails depending on where TMPDIR
+  happens to point.
+  """
+  for base in (None, "/tmp", "/var/tmp"):
+    directory = Path(tempfile.mkdtemp(dir=base))
+    if not any((parent / ".agents").is_dir() for parent in directory.parents):
+      return directory
+    shutil.rmtree(directory, ignore_errors=True)
+  raise unittest.SkipTest("no temporary directory outside an existing am store")
 
 
 class PortabilityTests(unittest.TestCase):
@@ -49,21 +66,22 @@ class PortabilityTests(unittest.TestCase):
 
   def test_link_from_outside_project(self) -> None:
     """The real CLI writes a pointer usable from an unrelated directory."""
-    with tempfile.TemporaryDirectory() as directory:
-      home = Path(directory)
-      project = home / "project"
-      outside = home / "outside"
-      project.mkdir()
-      outside.mkdir()
-      env = dict(os.environ, HOME=str(home))
-      env.pop("AM_ROOT", None)
-      subprocess.run([sys.executable, str(SCRIPT), "init", "--project", "fixture", "--link"],
-                     cwd=project, env=env, check=True, capture_output=True)
-      expected = str((project / ".agents").resolve())
-      self.assertEqual((home / ".am-root").read_text().strip(), expected)
-      result = subprocess.run([sys.executable, str(SCRIPT), "where"], cwd=outside, env=env,
-                              check=True, capture_output=True, text=True)
-      self.assertEqual(result.stdout.strip(), expected)
+    directory = isolated_root()
+    self.addCleanup(shutil.rmtree, directory, True)
+    home = Path(directory)
+    project = home / "project"
+    outside = home / "outside"
+    project.mkdir()
+    outside.mkdir()
+    env = dict(os.environ, HOME=str(home))
+    env.pop("AM_ROOT", None)
+    subprocess.run([sys.executable, str(SCRIPT), "init", "--project", "fixture", "--link"],
+                   cwd=project, env=env, check=True, capture_output=True)
+    expected = str((project / ".agents").resolve())
+    self.assertEqual((home / ".am-root").read_text().strip(), expected)
+    result = subprocess.run([sys.executable, str(SCRIPT), "where"], cwd=outside, env=env,
+                            check=True, capture_output=True, text=True)
+    self.assertEqual(result.stdout.strip(), expected)
 
   def test_symlink_scope(self) -> None:
     """Canonical aliases match while similarly prefixed siblings do not."""
