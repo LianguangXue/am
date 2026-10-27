@@ -1984,8 +1984,14 @@ def cmd_recall(am: Path, cfg: dict, args: argparse.Namespace) -> int:
 DASHBOARD_CACHE: dict[str, object] = {"at": 0.0, "payload": None, "scanned": 0.0}
 
 
-def state_payload(am: Path, cfg: dict, ttl: float = 15.0) -> dict:
-  """Snapshot everything the dashboard shows, cached briefly."""
+def state_payload(am: Path, cfg: dict, ttl: float = 3.0) -> dict:
+  """Snapshot everything the dashboard shows, cached briefly.
+
+  The TTL is short on purpose: a mutation made through the CLI runs in another
+  process and cannot invalidate this cache, so anything longer makes `am hide`
+  look like it did nothing. Rebuilding is cheap once ``cached_digest`` is warm,
+  because the expensive part is reading transcripts, not assembling the payload.
+  """
   stamp = time.time()
   if DASHBOARD_CACHE["payload"] is not None and stamp - float(DASHBOARD_CACHE["at"]) < ttl:
     return DASHBOARD_CACHE["payload"]  # type: ignore[return-value]
