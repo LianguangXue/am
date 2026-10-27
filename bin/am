@@ -266,6 +266,8 @@ MSG: dict[str, dict[str, str]] = {
   "d.new_store": {"en": "new store: set an objective with `am goal \"...\"`",
                   "zh": "新库：用 `am goal \"...\"` 设定目标"},
   "c.init": {"en": "initialised {v}", "zh": "已初始化 {v}"},
+  "c.exists": {"en": "already initialised at {v} — nothing changed (use --force to rewrite)",
+               "zh": "{v} 已经初始化过了，什么都没改（要重写请加 --force）"},
   "c.linked": {"en": "wrote {v} so `am` resolves from any directory",
                "zh": "已写入 {v}，从此任意目录都能找到库"},
   "c.init_hint": {"en": "next: run `am doctor`; the entry stanza is already wired into AGENTS.md and CLAUDE.md",
@@ -3156,6 +3158,12 @@ def bundled_doc(name: str) -> str:
 
 def cmd_init(am: Path, cfg: dict, args: argparse.Namespace) -> int:
   """Create the store tree, config, and ignore rules."""
+  if (am / "config.json").exists() and not getattr(args, "force", False):
+    # Re-initialising an existing store used to rewrite its config and DESIGN.md
+    # in place, silently renaming the project for anyone who ran it from the
+    # wrong directory.
+    print(T("c.exists", v=am))
+    return 0
   for sub in ("journal", "tasks", "leases", "briefs"):
     (am / sub).mkdir(parents=True, exist_ok=True)
   save_json(am / "config.json", cfg)
@@ -3754,6 +3762,8 @@ def build_parser() -> argparse.ArgumentParser:
   p.add_argument("--project", help="project name shown in state and briefs")
   p.add_argument("--link", action="store_true",
                  help="also write ~/.am-root so `am` works from any directory")
+  p.add_argument("--force", action="store_true",
+                 help="rewrite an existing store's config and docs")
   p.set_defaults(func=cmd_init)
 
   p = sub.add_parser("goal", help="record the project objective")
