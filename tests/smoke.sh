@@ -104,4 +104,16 @@ grep -q 'id="pane"' "$WORK/page.html" || fail "dashboard page did not render"
 ! grep -q '__PROJECT__' "$WORK/page.html" || fail "dashboard did not substitute the project name"
 ok "dashboard serves state and page"
 
+# Bulk suppression is what the dashboard's multi-select posts to; the ids do not
+# have to correspond to real sessions for the endpoint contract to be checked.
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  -d '{"shorts":["smoke-a","smoke-b"]}' "http://127.0.0.1:$PORT/api/hide" -o "$WORK/hide.json" \
+  || fail "bulk hide endpoint"
+grep -q 'smoke-a' "$WORK/hide.json" || fail "bulk hide did not record the ids"
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  -d '{"shorts":["smoke-a","smoke-b"],"undo":true}' "http://127.0.0.1:$PORT/api/hide" -o "$WORK/undo.json" \
+  || fail "bulk restore endpoint"
+grep -q 'smoke-a' "$WORK/undo.json" && fail "bulk restore left an id behind"
+ok "bulk hide and restore"
+
 printf '\nall checks passed\n'

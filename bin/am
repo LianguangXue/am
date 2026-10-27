@@ -1077,19 +1077,33 @@ def hidden_state(am: Path) -> dict:
   return hidden if isinstance(hidden, dict) else {}
 
 
-def hide_session(am: Path, short: str, why: str, state: bool = True) -> int:
-  """Add or remove one session from the suppressed set."""
+def hide_sessions(am: Path, shorts: list[str], why: str, state: bool = True) -> int:
+  """Add or remove several sessions in one write.
+
+  Batch selection in the dashboard hides many at once; doing that one file
+  rewrite per id would leave the store readable in a half-applied state if the
+  process died halfway through.
+  """
   data = hidden_state(am)
-  key = short.strip()
-  if not key:
-    die(T("e.bad_session"))
-  if state:
-    data[key] = {"at": iso(now()), "why": why}
-  else:
-    data.pop(key, None)
+  stamp = iso(now())
+  for short in shorts:
+    key = str(short).strip()
+    if not key:
+      continue
+    if state:
+      data[key] = {"at": stamp, "why": why}
+    else:
+      data.pop(key, None)
   save_json(am / "hidden.json", {"hidden": data})
   DASHBOARD_CACHE["at"] = 0.0
   return len(data)
+
+
+def hide_session(am: Path, short: str, why: str, state: bool = True) -> int:
+  """Add or remove one session from the suppressed set."""
+  if not str(short).strip():
+    die(T("e.bad_session"))
+  return hide_sessions(am, [short], why, state)
 
 
 def cmd_hide(am: Path, cfg: dict, args: argparse.Namespace) -> int:
@@ -2117,6 +2131,28 @@ DASHBOARD_HTML = r"""<!doctype html>
   .shell{display:grid;grid-template-columns:292px minmax(0,1fr);height:calc(100vh - 49px)}
   .side{border-right:1px solid var(--line);background:#0b0e13;display:flex;flex-direction:column;min-height:0}
   .side-top{padding:11px 11px 8px;border-bottom:1px solid var(--line)}
+  .tools{display:flex;gap:6px;margin-top:7px}
+  .tools .icon{flex:1;display:flex;align-items:center;justify-content:center;gap:5px;
+       border:1px solid var(--line2);background:#0f131a;font-size:11.5px;padding:4px 8px}
+  .tools .icon.on{color:var(--accent);border-color:#22405f;background:#0d1826}
+  .bulkbar{display:flex;align-items:center;gap:8px;margin:0 9px 9px;padding:8px 10px;
+       background:#141d29;border:1px solid #233549;border-radius:9px;font-size:12px;color:var(--mid)}
+  .bulkbar[hidden]{display:none}
+  .bulkbar b{color:var(--fg);font-variant-numeric:tabular-nums}
+  .bulkbar .btn{margin-left:auto;padding:3px 10px;font-size:11.5px}
+  .menu{position:fixed;z-index:80;min-width:198px;padding:5px;background:#161b25;
+       border:1px solid #2f3a4d;border-radius:10px;box-shadow:0 12px 34px rgba(0,0,0,.55)}
+  .menu button{display:flex;align-items:center;gap:8px;width:100%;padding:7px 9px;
+       background:none;border:none;border-radius:6px;color:#c9d4e6;font:inherit;
+       font-size:12.5px;text-align:left;cursor:pointer}
+  .menu button:hover{background:#212b3a;color:var(--fg)}
+  .menu button.danger:hover{background:#2a161a;color:#ffb3ba}
+  .menu .sep{height:1px;background:#232a38;margin:4px 2px}
+  .menu .note{padding:5px 9px 3px;color:var(--faint);font-size:10.5px;letter-spacing:.08em;text-transform:uppercase}
+  .item .pick{width:13px;height:13px;flex:none;border:1px solid #3c4657;border-radius:4px}
+  .item .pick.on{background:var(--accent);border-color:var(--accent);
+       box-shadow:inset 0 0 0 2px #0b0e13}
+  .item.picked{background:#141d29}
   .find{display:flex;align-items:center;gap:7px;background:#0f131a;border:1px solid var(--line2);
         border-radius:8px;padding:6px 10px}
   .find:focus-within{border-color:#33507a;box-shadow:0 0 0 2px rgba(110,168,254,.1)}
@@ -2242,12 +2278,23 @@ DASHBOARD_HTML = r"""<!doctype html>
 </header>
 <div class="shell">
   <aside class="side">
-    <div class="side-top"><div class="find">
-      <span style="color:var(--faint);font-size:12px">⌕</span>
-      <input id="q" placeholder="搜索会话 / 标题 / 内容" autocomplete="off">
-      <kbd>/</kbd>
-    </div></div>
+    <div class="side-top">
+      <div class="find">
+        <span style="color:var(--faint);font-size:12px">⌕</span>
+        <input id="q" placeholder="搜索会话 / 标题 / 内容" autocomplete="off">
+        <kbd>/</kbd>
+      </div>
+      <div class="tools">
+        <button class="icon" id="bulk" title="批量选择（快捷键 b）">批量选择</button>
+        <button class="icon" id="hideall" title="隐藏当前筛选结果">隐藏筛选结果</button>
+      </div>
+    </div>
     <div class="nav" id="nav"></div>
+    <div class="bulkbar" id="bulkbar" hidden>
+      已选 <b id="pickn">0</b> 个
+      <button class="btn" id="pick-hide">隐藏</button>
+      <button class="btn ghost" id="pick-clear">取消</button>
+    </div>
   </aside>
   <main class="pane" id="pane"></main>
 </div>
@@ -2260,7 +2307,8 @@ const chip = (c,t) => `<span class="chip ${c}">${esc(t)}</span>`;
 const live = q => q <= 2 ? 'live' : (q <= 15 ? 'idle' : '');
 const AGENTS = ['claude-code','codex','dsh'];
 
-const S = { q:'', sel:null, showHidden:false, paused:false, data:null, sig:'', closed:new Set() };
+const S = { q:'', sel:null, showHidden:false, paused:false, data:null, sig:'', closed:new Set(),
+            batch:false, picked:new Set() };
 
 function toast(msg){ const t=document.getElementById('toast'); t.textContent=msg; t.classList.add('on');
   clearTimeout(toast._t); toast._t=setTimeout(()=>t.classList.remove('on'),1400); }
@@ -2291,8 +2339,12 @@ function navRow(r, muted){
   const wf = r.workflow && r.workflow.name ? `wf ${r.workflow.reached}/${(r.workflow.phases||[]).length}` : '';
   const main = (S.data.main||{}).short === r.short;
   const name = r.title || r.progress || r.short;
-  return `<button class="item ${S.sel===r.short?'on':''} ${muted?'muted':''} ${main?'main':''}"
-      data-short="${esc(r.short)}"><span class="dot ${muted?'':live(r.quiet)}"></span>
+  const picked = S.picked.has(r.short);
+  const mark = S.batch
+    ? `<span class="pick ${picked?'on':''}"></span>`
+    : `<span class="dot ${muted?'':live(r.quiet)}"></span>`;
+  return `<button class="item ${S.sel===r.short?'on':''} ${muted?'muted':''} ${main?'main':''} ${picked?'picked':''}"
+      data-short="${esc(r.short)}" ${muted?'data-hidden="1"':''}>${mark}
       <span class="nm">${esc(cut(name, 26))}</span>
       <span class="q">${wf || (muted ? '隐藏' : dur(r.quiet))}</span></button>`;
 }
@@ -2317,6 +2369,74 @@ function renderNav(){
   if (!groups.length && !S.q) html += `<div class="nav-empty">最近 ${S.data.window_days||30} 天没有会话</div>`;
   if (!groups.length && S.q) html += `<div class="nav-empty">没有匹配「${esc(S.q)}」的会话</div>`;
   document.getElementById('nav').innerHTML = html;
+  syncBulkUI();
+}
+
+function syncBulkUI(){
+  const bar = document.getElementById('bulkbar');
+  if (!bar) return;
+  bar.hidden = !S.batch;
+  const n = document.getElementById('pickn');
+  if (n) n.textContent = S.picked.size;
+  const b = document.getElementById('bulk');
+  if (b) b.classList.toggle('on', S.batch);
+  const h = document.getElementById('pick-hide');
+  if (h) h.disabled = S.picked.size === 0;
+}
+
+function setBatch(on){
+  S.batch = on;
+  if (!on) S.picked.clear();
+  renderNav();
+}
+
+async function hideMany(shorts, undo=false){
+  const ids = [...new Set(shorts)].filter(Boolean);
+  if (!ids.length) return;
+  await fetch('/api/hide', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({shorts: ids, undo, why:'ui'})});
+  toast(`${undo ? '已恢复' : '已隐藏'} ${ids.length} 个会话`);
+  S.picked.clear(); S.batch = false;
+  await tick(true);
+}
+
+// ---------------------------------------------------------------- context menu
+let menuEl = null;
+
+function closeMenu(){
+  if (menuEl) { menuEl.remove(); menuEl = null; }
+}
+
+function openMenu(x, y, short, hidden){
+  closeMenu();
+  const menu = document.createElement('div');
+  menu.className = 'menu';
+  const item = (label, fn, cls) => {
+    const b = document.createElement('button');
+    b.textContent = label;
+    if (cls) b.className = cls;
+    b.addEventListener('click', ev => { ev.stopPropagation(); closeMenu(); fn(); });
+    return b;
+  };
+  const head = document.createElement('div');
+  head.className = 'note';
+  head.textContent = short;
+  menu.append(head);
+
+  if (hidden) {
+    menu.append(item('恢复显示', () => hideMany([short], true)));
+  } else {
+    menu.append(item('隐藏这个会话', () => hideMany([short])));
+    menu.append(item('选中并进入批量', () => { S.batch = true; S.picked.add(short); renderNav(); }));
+    menu.append(Object.assign(document.createElement('div'), {className:'sep'}));
+  }
+  menu.append(item('复制 am adopt ' + short, () => copy('am adopt ' + short)));
+  menu.append(item('复制会话 id', () => copy(short)));
+
+  menu.style.left = Math.min(x, window.innerWidth - 214) + 'px';
+  menu.style.top = Math.min(y, window.innerHeight - 190) + 'px';
+  document.body.append(menu);
+  menuEl = menu;
 }
 
 function tile(n,label,cls){ return `<div class="tile ${cls||''}"><b>${n}</b><span>${esc(label)}</span></div>`; }
@@ -2458,18 +2578,51 @@ document.addEventListener('click', e => {
   const cp=e.target.closest('[data-copy]'); if(cp){ copy(cp.dataset.copy); return; }
   const hd=e.target.closest('[data-hide]');
   if(hd){ if(!trusted) return; toggleHide(hd.dataset.hide, hd.dataset.undo==='1'); return; }
-  const it=e.target.closest('.item'); if(it){ select(it.dataset.short||null); return; }
+  const it=e.target.closest('.item');
+  if(it){
+    const short = it.dataset.short || '';
+    if (S.batch && short) {
+      if (S.picked.has(short)) S.picked.delete(short); else S.picked.add(short);
+      renderNav();
+      return;
+    }
+    select(short || null);
+    return;
+  }
+  if(e.target.closest('#bulk')){ setBatch(!S.batch); return; }
+  if(e.target.closest('#pick-hide')){ if(trusted) hideMany([...S.picked]); return; }
+  if(e.target.closest('#pick-clear')){ setBatch(false); return; }
+  if(e.target.closest('#hideall')){
+    if(!trusted) return;
+    const rows = ordered().groups.flatMap(g => g.rows.map(r => r.short));
+    if(rows.length && confirm(`隐藏当前筛选出的 ${rows.length} 个会话？\n（随时可以在「已隐藏」里恢复）`)) hideMany(rows);
+    return;
+  }
+  if(menuEl){ closeMenu(); }
   if(e.target.closest('#toggle-hidden')){ S.showHidden=!S.showHidden; renderNav(); return; }
   const g=e.target.closest('.grp[data-g]');
   if(g){ const k=g.dataset.g; if(S.closed.has(k)) S.closed.delete(k); else S.closed.add(k); renderNav(); }
 });
 
+document.addEventListener('contextmenu', e => {
+  const it = e.target.closest('.item');
+  if (!it || !it.dataset.short) return;
+  e.preventDefault();
+  const short = it.dataset.short;
+  openMenu(e.clientX, e.clientY, short, it.dataset.hidden === '1');
+});
+
 document.addEventListener('keydown', e => {
   const typing = e.target.tagName === 'INPUT';
   if (e.key === '/' && !typing) { e.preventDefault(); document.getElementById('q').focus(); return; }
+  if (e.key === 'Escape') {
+    if (menuEl) { closeMenu(); return; }
+    if (S.batch) { setBatch(false); return; }
+  }
   if (e.key === 'Escape') { if (typing) { e.target.value=''; S.q=''; renderNav(); e.target.blur(); }
                             else select(null); return; }
   if (typing) return;
+  if (e.key === 'b') { setBatch(!S.batch); return; }
   if (e.key === 'p') { S.paused=!S.paused;
     const b=document.getElementById('pause'); b.classList.toggle('on', S.paused);
     b.textContent = S.paused ? '已暂停' : '暂停';
@@ -2538,13 +2691,18 @@ def cmd_serve(am: Path, cfg: dict, args: argparse.Namespace) -> int:
       except (ValueError, json.JSONDecodeError):
         self.send_error(400)
         return
-      short = str(body.get("short") or "").strip()
-      if not short:
+      singles = [str(body.get("short") or "")]
+      bulk = body.get("shorts")
+      if isinstance(bulk, list):
+        singles += [str(item) for item in bulk]
+      targets = list(dict.fromkeys(item.strip() for item in singles if item.strip()))
+      if not targets:
         self.send_error(400)
         return
       undo = bool(body.get("undo"))
-      hide_session(am, short, str(body.get("why") or "manual"), state=not undo)
-      print(f"{'restore' if undo else 'hide'} {short} via dashboard", file=sys.stderr)
+      hide_sessions(am, targets, str(body.get("why") or "ui"), state=not undo)
+      print(f"{'restore' if undo else 'hide'} {len(targets)} session(s) via dashboard: "
+            f"{','.join(targets)}", file=sys.stderr)
       # The snapshot TTL is long enough to make the UI feel stale after a
       # mutation, so drop it under the same lock the GET path uses.
       with state_lock:
