@@ -855,10 +855,10 @@ def session_in_scope(agent: str, path: Path, root: Path, slug: str) -> bool:
 
   Path slugs alone are not enough. Claude Code and DSH *do* encode the cwd in
   their directory names, but Codex partitions by date, and — the case that
-  actually matters here — a session started in ``/home/vic`` writes to a
-  different Claude directory than one started in ``the project``.
+  actually matters here — a session started in ``$HOME`` writes to a different
+  Claude directory than one started inside the project.
   Matching on the slug therefore hid every session launched from a parent
-  directory, which on this machine is all of them.
+  directory, which is the common case when agents are started from a shell.
 
   A session is in scope when its recorded cwd and the store root are on the same
   path in either direction: the session may have run inside the project, or in a
