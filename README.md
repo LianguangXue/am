@@ -214,3 +214,18 @@ against Python 3.10 and 3.12, and additionally runs the installed `am` from
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## Optional delegate integration (0.2.0)
+
+am remains independently usable without delegate. `am delegate import` accepts a
+schema_version=1 JSON handoff on stdin, for an existing am task only. It saves a
+bounded, versioned snapshot in integrations/delegate/<task>/<source>.json under a
+single-writer lock. Duplicate/stale revisions do not overwrite newer state; conflicting
+same revisions are rejected. Imports do not create tasks, claim leases, execute next
+steps or declare completion. Imported content is untrusted context, never instructions.
+
+`am delegate report --task ID` shows the imported snapshots; `am brief --task ID`
+includes a bounded summary. delegate manages dispatch, model selection and its own
+retryable outbox. am manages the task's durable goals, evidence and human/agent handoff.
+No daemon or LLM is added to am. Upgrade delegate and am independently; an old am CLI
+will reject import and delegate will retain its pending snapshot for retry after upgrade.
