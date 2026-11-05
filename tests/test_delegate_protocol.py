@@ -13,6 +13,19 @@ API = runpy.run_path(str(Path(__file__).resolve().parents[1] / "bin/am"))
 
 
 class ProtocolTests(unittest.TestCase):
+  def test_conflicting_scoped_summaries_do_not_claim_acceptance(self) -> None:
+    with tempfile.TemporaryDirectory() as directory:
+      root = Path(directory)
+      target = root / "integrations/delegate/task"
+      target.mkdir(parents=True)
+      (target / "index.json").write_text('["a","b"]')
+      for source, review in (("a", "accepted"), ("b", "needs-work")):
+        (target / (source + ".json")).write_text(json.dumps({"session_id": "s", "jobs": [
+          {"id": "j", "status": "completed", "review": review, "collected_at": 1}]}))
+      result = API["delegate_summary"](root, "task")
+      self.assertEqual(result["conflicting"], 1)
+      self.assertEqual(result["accepted"], 0)
+
   def test_stale_and_duplicate_imports_never_roll_back_or_complete_task(self) -> None:
     with tempfile.TemporaryDirectory() as directory:
       root = Path(directory)

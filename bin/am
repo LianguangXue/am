@@ -41,7 +41,7 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 EVENT_TYPES = ("goal", "task", "claim", "decision", "cmd", "result", "blocker", "next", "done", "note")
 LEASE_DEFAULT_MIN = 45
@@ -2034,6 +2034,7 @@ def state_payload(am: Path, cfg: dict, ttl: float = 3.0) -> dict:
       "next": item.get("next") or "",
       "accept": item.get("accept") or "",
       "evidence": item.get("evidence") or "",
+      "delegate": delegate_summary(am, item["id"]),
     })
 
   suppressed = hidden_state(am)
@@ -2470,6 +2471,7 @@ function renderSummary(){
         ? ` / <span class="link" data-jump="${esc(known)}">${esc(known)}</span>`
         : (t.session ? ' / ' + esc(t.session.slice(0,13)) : '')}</div>
       ${t.next ? `<div class="nx">→ ${esc(t.next)}</div>` : ''}
+      ${t.delegate?.shown ? `<div class="sub">Delegate 摘要：运行 ${t.delegate.running} · 待读取 ${t.delegate.uncollected} · 待验收 ${t.delegate.awaiting_review} · 通过 ${t.delegate.accepted} · 返工 ${t.delegate.needs_work} · 状态冲突 ${t.delegate.conflicting}</div>` : ''}
     </div><div style="display:flex;flex-direction:column;gap:6px;align-items:flex-end">
       ${chip(t.status==='blocked'?'bad':t.status==='claimed'?'acc':'ghost', t.status)}
       ${t.quiet!=null?chip(t.idle?'bad':'ok','quiet '+dur(t.quiet)):''}
@@ -3375,6 +3377,26 @@ def delegate_packets(am: Path, task_id: str) -> list[dict]:
   directory = am / "integrations" / "delegate" / task_id
   ids = load_json(directory / "index.json", [])
   return [load_json(directory / (key + ".json"), {}) for key in ids[-20:]]
+
+
+def delegate_summary(am: Path, task_id: str) -> dict:
+  """Expose collection and acceptance separately; omitted jobs remain explicit."""
+  packets = delegate_packets(am, task_id)
+  jobs, conflicts = {}, set()
+  for packet in packets:
+    for job in packet.get("jobs", []):
+      key = (packet["session_id"], job["id"])
+      if key in jobs and any(jobs[key].get(k) != job.get(k) for k in ("status", "review", "collected_at")):
+        conflicts.add(key)
+      jobs[key] = job
+  for key in conflicts:
+    jobs[key] = {"status": "conflicting", "review": "pending"}
+  return {"shown": len(jobs), "conflicting": len(conflicts), "omitted": sum(p.get("jobs_omitted", 0) for p in packets),
+    "running": sum(j["status"] in {"queued", "running", "cancelling", "archiving"} for j in jobs.values()),
+    "uncollected": sum(not j.get("collected_at") and j["status"] not in {"queued", "running", "cancelling", "archiving"} for j in jobs.values()),
+    "awaiting_review": sum(bool(j.get("collected_at")) and j.get("review") == "pending" for j in jobs.values()),
+    "accepted": sum(j.get("review") == "accepted" for j in jobs.values()),
+    "needs_work": sum(j.get("review") in {"needs-work", "blocked"} for j in jobs.values())}
 
 
 def delegate_brief(am: Path, task_id: str) -> str:

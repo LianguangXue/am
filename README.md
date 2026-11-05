@@ -229,3 +229,9 @@ includes a bounded summary. delegate manages dispatch, model selection and its o
 retryable outbox. am manages the task's durable goals, evidence and human/agent handoff.
 No daemon or LLM is added to am. Upgrade delegate and am independently; an old am CLI
 will reject import and delegate will retain its pending snapshot for retry after upgrade.
+
+Version 0.3.0 adds delegate summary counts to task cards: running, uncollected,
+awaiting review, accepted, needs-work and conflicting. Conflicting snapshots never
+count as accepted. These are bounded imported summaries, not a process liveness
+monitor or an automatic lease-transfer authority. Restart an existing am serve
+process to load the new task-card UI.
