@@ -41,7 +41,7 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 EVENT_TYPES = ("goal", "task", "claim", "decision", "cmd", "result", "blocker", "next", "done", "note")
 LEASE_DEFAULT_MIN = 45
@@ -2000,6 +2000,74 @@ def cmd_recall(am: Path, cfg: dict, args: argparse.Namespace) -> int:
 DASHBOARD_CACHE: dict[str, object] = {"at": 0.0, "payload": None, "scanned": 0.0}
 
 
+DELEGATE_VIEW_CACHE: dict = {}
+
+
+def delegate_overview(cfg: dict) -> dict:
+  """Read a bounded index of local delegate jobs, without importing or changing them."""
+  root = Path(cfg.get("delegate_state_dir") or os.environ.get("DELEGATE_STATE_DIR") or
+              Path.home() / ".claude/delegate").expanduser()
+  key = str(root)
+  cached = DELEGATE_VIEW_CACHE.get(key)
+  if cached and time.time() - cached[0] < 15:
+    return cached[1]
+  def read(path: Path):
+    import stat
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    with os.fdopen(fd, "rb") as stream:
+      if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+        raise ValueError("overview records must be regular files")
+      raw = stream.read(2_000_001)
+    if len(raw) > 2_000_000:
+      raise ValueError("record exceeds overview read limit")
+    return json.loads(raw)
+  result = {"jobs": [], "source": str(root), "errors": 0,
+            "coverage": "最近20个delegate任务，最多50次执行；只读概览，不表示已关联am"}
+  try:
+    ids = read(root / "task-index.json")
+    if not isinstance(ids, list):
+      raise ValueError("invalid task index")
+    seen = set()
+    for tid in reversed(ids[-20:]):
+      if not isinstance(tid, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", tid):
+        continue
+      try:
+        task = read(root / ("task-" + tid + ".json"))
+        if task.get("id") != tid or not isinstance(task.get("session_id"), str) or not task["session_id"]:
+          raise ValueError("task identity mismatch")
+        for jid in reversed(task.get("jobs", [])[-50:]):
+          if len(seen) >= 50:
+            break
+          if not isinstance(jid, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", jid) or jid in seen:
+            continue
+          seen.add(jid)
+          try:
+            job = read(root / ("job-" + jid + ".json"))
+            if job.get("id") != jid or job.get("task_id") != tid or job.get("session_id") != task["session_id"]:
+              result["errors"] += 1
+              continue
+            archive = job.get("cli_session") or job.get("codex_session") or {}
+            result["jobs"].append({k: job.get(k) for k in
+              ("id", "session_id", "task_id", "work_item", "provider_name", "model", "effort", "status", "review", "collected_at")} |
+              {"conversation": archive.get("status", "unknown"),
+               "has_thread": bool(job.get("thread_id"))})
+          except (OSError, ValueError, TypeError, AttributeError):
+            result["errors"] += 1
+          if len(seen) >= 50:
+            break
+      except (OSError, ValueError, TypeError, AttributeError):
+        result["errors"] += 1
+      if len(seen) >= 50:
+        break
+  except FileNotFoundError:
+    result["note"] = "尚未找到本机delegate任务索引"
+  except (OSError, ValueError, TypeError):
+    result["note"] = "无法读取delegate任务索引"
+    result["errors"] += 1
+  DELEGATE_VIEW_CACHE[key] = (time.time(), result)
+  return result
+
+
 def state_payload(am: Path, cfg: dict, ttl: float = 3.0) -> dict:
   """Snapshot everything the dashboard shows, cached briefly.
 
@@ -2078,6 +2146,7 @@ def state_payload(am: Path, cfg: dict, ttl: float = 3.0) -> dict:
     "store": str(am),
     "generated": iso(now()),
     "tasks": tasks,
+    "delegate_overview": delegate_overview(cfg),
     "sessions": sessions,
     "active": [row["short"] for row in active],
     "hidden": hidden_rows,
@@ -2462,6 +2531,19 @@ function renderSummary(){
       <div>${chip('ok','quiet '+dur(main.quiet))}</div></div>`;
   }
 
+  const dv = S.data.delegate_overview || {jobs:[]};
+  h += `<div class="sec-t">Delegate 子任务</div><div class="sub">${esc(dv.coverage||'')}
+    · 已关联am的任务 ${(S.data.tasks||[]).filter(t=>t.delegate?.shown).length}</div>`;
+  h += dv.jobs.length ? dv.jobs.map(j=>`<div class="row"><div class="m">
+    <div><span class="id">${esc(j.id)}</span> ${esc(j.work_item||'')}</div>
+    <div class="sub">${esc(j.provider_name||'')} · ${esc(j.model||'')} / ${esc(j.effort||'')}
+    · 验收 ${esc(j.review||'pending')} · 对话 ${esc(j.conversation)}</div>
+    ${j.has_thread && ['completed','failed','timed_out','cancelled'].includes(j.status)
+      ? `<div class="nx">可在所属主会话请求续接：/delegate resume ${esc(j.id)} &lt;后续任务&gt;</div>` : ''}
+    </div><div>${chip('ghost',j.status||'unknown')}</div></div>`).join('')
+    : `<div class="empty-box">${esc(dv.note||'尚无delegate子任务记录')}。关联后可在am任务卡中查看交接摘要。</div>`;
+  if (dv.errors) h += `<div class="sub">有 ${dv.errors} 项记录未能读取；上方不是完整清单。</div>`;
+
   h += `<div class="sec-t">在飞任务</div>`;
   h += tasks.length ? tasks.map(t => {
     const known = (S.data.sessions||[]).some(s=>s.short===t.session) ? t.session : null;
@@ -2471,7 +2553,7 @@ function renderSummary(){
         ? ` / <span class="link" data-jump="${esc(known)}">${esc(known)}</span>`
         : (t.session ? ' / ' + esc(t.session.slice(0,13)) : '')}</div>
       ${t.next ? `<div class="nx">→ ${esc(t.next)}</div>` : ''}
-      ${t.delegate?.shown ? `<div class="sub">Delegate 摘要：运行 ${t.delegate.running} · 待读取 ${t.delegate.uncollected} · 待验收 ${t.delegate.awaiting_review} · 通过 ${t.delegate.accepted} · 返工 ${t.delegate.needs_work} · 状态冲突 ${t.delegate.conflicting}</div>` : ''}
+      ${t.delegate?.shown ? `<div class="sub">Delegate 摘要：运行 ${t.delegate.running} · 待读取 ${t.delegate.uncollected} · 待验收 ${t.delegate.awaiting_review} · 通过 ${t.delegate.accepted} · 返工 ${t.delegate.needs_work} · 状态冲突 ${t.delegate.conflicting}</div>` : '<div class="sub">尚未关联delegate交接记录</div>'}
     </div><div style="display:flex;flex-direction:column;gap:6px;align-items:flex-end">
       ${chip(t.status==='blocked'?'bad':t.status==='claimed'?'acc':'ghost', t.status)}
       ${t.quiet!=null?chip(t.idle?'bad':'ok','quiet '+dur(t.quiet)):''}
@@ -3420,6 +3502,31 @@ def delegate_brief(am: Path, task_id: str) -> str:
   return "\n".join(output)
 
 
+def cmd_work(am: Path, cfg: dict, args: argparse.Namespace) -> int:
+  """Drive the local no-inference collaboration protocol using bounded JSON stdin."""
+  import runpy
+  module = runpy.run_path(str(Path(__file__).resolve().with_name("am_work.py")))
+  raw = sys.stdin.read(64001)
+  if len(raw)>64000:
+    die("Work request too large")
+  try:
+    data=json.loads(raw)
+    if not isinstance(data,dict):raise ValueError("JSON object required")
+    if not 0 <= args.wait <= 86400:raise ValueError("--wait must be 0..86400 seconds")
+    if args.wait and args.action!='poll':raise ValueError("--wait only supports poll")
+    result=module["execute"](am,args.action,data)
+    if args.wait:
+      deadline=time.monotonic()+args.wait
+      while result.get('status')=='waiting' and time.monotonic()<deadline:
+        time.sleep(min(30,max(0,deadline-time.monotonic())))
+        result=module['execute'](am,'poll',data)
+    print(json.dumps(result,ensure_ascii=False))
+    return 0
+  except (OSError,ValueError,KeyError,TypeError) as exc:
+    die(str(exc))
+  return 2
+
+
 def cmd_delegate(am: Path, cfg: dict, args: argparse.Namespace) -> int:
   """Import versioned delegate snapshots idempotently or inspect one task's handoff."""
   if args.action == "report":
@@ -4008,6 +4115,11 @@ def build_parser() -> argparse.ArgumentParser:
   p.add_argument("--reason", help="why it is being hidden")
   p.add_argument("--undo", action="store_true", help="restore instead of hiding")
   p.set_defaults(func=cmd_hide)
+
+  p = sub.add_parser("work", help="local artifacts, bounded questions and completion receipts (no model)")
+  p.add_argument("action", choices=("publish","search","get","configure","ask","inbox","reply","watch","poll","ack","stage","stage-check"))
+  p.add_argument("--wait",type=int,default=0,metavar="SECONDS")
+  p.set_defaults(func=cmd_work)
 
   p = sub.add_parser("delegate", help="import or inspect versioned delegate handoffs")
   p.add_argument("action", choices=("import", "report"))

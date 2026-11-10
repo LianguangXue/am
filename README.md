@@ -7,8 +7,8 @@ of quota or dies mid-task, the next picks up from the artifacts instead of from
 scratch — and when the first comes back, it continues from whatever the second
 finished.
 
-No daemon, no database, no API keys. The core is a single stdlib-only Python
-file plus a directory.
+No daemon, no database, no API keys. The core is a stdlib-only Python CLI plus a directory; the optional work protocol
+ships in the adjacent `bin/am_work.py` module.
 
 ```
 $ am brief --for codex
@@ -58,6 +58,10 @@ Everything is plain files under `.agents/`, so `git log`, `grep`, `cat` and `rsy
 all work on your agent's memory.
 
 ---
+
+## 快速开始
+
+[中文安装与联动手册](docs/INSTALL.zh-CN.md) · [delegate 三宿主安装](https://github.com/LianguangXue/delegate/blob/main/docs/INSTALL.zh-CN.md)
 
 ## Install
 
@@ -235,3 +239,61 @@ awaiting review, accepted, needs-work and conflicting. Conflicting snapshots nev
 count as accepted. These are bounded imported summaries, not a process liveness
 monitor or an automatic lease-transfer authority. Restart an existing am serve
 process to load the new task-card UI.
+
+Version 0.3.1 adds a separate read-only Delegate overview on the summary page,
+including jobs not linked to an am task. It reads only a bounded task index from
+`delegate_state_dir` (config), `DELEGATE_STATE_DIR`, or `~/.claude/delegate`;
+no home-directory scans or automatic task binding are performed. The overview covers
+the last 20 indexed tasks and at most 50 job records, cached for 15 seconds. It shows
+provider/model, execution/review and archive state without prompts or result bodies.
+Missing, oversized, malformed or non-regular records are reported as incomplete;
+job/task/session identity must match. Empty am task cards explicitly show that no
+delegate handoff has been linked. Resume remains a user request in the owning host,
+not an action performed by this dashboard.
+
+## Quota-first work protocol (0.4.0)
+
+`am work ACTION` reads one bounded JSON object on stdin. It never invokes an LLM or
+executes payload commands. The optional module `bin/am_work.py` must stay beside
+`bin/am` (the normal source installation already does this).
+
+Actions:
+- `publish`: id, project, task_id, session_id, summary, evidence, files (absolute paths).
+  Existing am task required. Updates require the original owner and expected_revision.
+- `search`: exact project namespace + query. Up to three short lexical results;
+  freshness is unchecked. `get`: project + id validates the nominated evidence.
+- `watch`: id/task_id/session_id/manifest. The producer writes JSON
+  `{"status":"completed","evidence":"exit code and artifacts"}` or status failed.
+  `poll`: id/session_id. `am work poll --wait 86400` waits in code, with 30-second
+  checks and no model polling, and can run through a host's background shell tool.
+  `ack` acknowledges the stable event. It does not independently verify success or
+  control the producer process. Without host notification, callers explicitly read
+  the durable receipt; closed sessions are not automatically restarted.
+- `stage`: id/task_id/files/evidence/requires (stage IDs). Only record after actual
+  validation. Duplicate IDs are rejected and dependencies checked recursively.
+  `stage-check`: id. Changed evidence means stale. Missing checkpoints are not proof
+  that an external action never happened. This registry does not run workflows.
+- `configure`: task_id/enabled. Questions default disabled. `ask`:
+  task_id/session_id/target_session/question, optional artifact_versions. One new
+  question per am task, <=2000 chars, no forwarding. Duplicates reuse the request ID.
+  `inbox`: session_id. `reply`: id/session_id/reply (<=2000 chars). Re-enabling does
+  not reset spent budget. Queueing does not wake or launch a model; host-native
+  delivery or an explicit inbox read is required. This is a request-count budget,
+  not an in-flight token cap. A crash after budget reservation may consume the slot
+  without sending; fail closed rather than silently issue another request.
+
+Nominate 1..16 regular files/manifests <=16MiB each. Large data must use producer
+manifests; no recursive scans or extra LLM summarization. Project namespaces prevent
+accidental mixing, not access control against another process using the same OS user.
+All imported summaries/questions remain data, not authority to claim a lease, execute
+commands or publish results. Existing delegate metrics support matched-task evaluation;
+no token-savings estimate is inferred merely from a search hit.
+
+Example lookup:
+
+```sh
+printf '%s\n' '{"project":"execution","query":"frozen replay"}' | am work search
+```
+
+Validate with `python3 -m unittest discover -s tests -p test_work.py -q` in addition
+to the existing smoke suite. Every test uses disposable state and no inference.
