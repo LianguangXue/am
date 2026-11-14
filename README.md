@@ -15,6 +15,8 @@ live status/phase, model and effort, heartbeat, observed tokens, errors and exac
 parent-session links. Filter by activity, attention, provider or search text. It reads
 bounded local indexes without invoking models or requiring an am task binding.
 See [dashboard usage](docs/DASHBOARD.zh-CN.md). The existing memory store is preserved.
+Version0.5.1 refuses to overwrite unreadable task, lease, config and handoff records;
+read-only dashboard projections retain tolerant reads. See [store recovery](docs/STORE-INTEGRITY.zh-CN.md).
 
 ```
 $ am brief --for codex

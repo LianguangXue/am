@@ -48,7 +48,7 @@ import urllib.parse
 from datetime import datetime, timedelta
 from pathlib import Path
 
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 
 EVENT_TYPES = ("goal", "task", "claim", "decision", "cmd", "result", "blocker", "next", "done", "note")
 LEASE_DEFAULT_MIN = 45
@@ -513,9 +513,9 @@ def save_json(path: Path, payload: object) -> None:
 
 def load_config(am: Path) -> dict:
   """Return the store configuration, filling in defaults."""
-  cfg = load_json(am / "config.json", {})
+  cfg = load_json(am / "config.json", {}, strict=True)
   if not isinstance(cfg, dict):
-    cfg = {}
+    raise ValueError("Store config must be a JSON object; original file preserved")
   cfg.setdefault("project", am.parent.name)
   cfg.setdefault("lease_minutes", LEASE_DEFAULT_MIN)
   cfg.setdefault("brief_tokens", BRIEF_DEFAULT_TOKENS)
@@ -573,8 +573,11 @@ def load_tasks(am: Path) -> list[dict]:
 
 def get_task(am: Path, task_id: str, required: bool = True) -> dict | None:
   """Load one task or fail with a helpful message."""
-  record = load_json(task_path(am, task_id), None)
+  path = task_path(am, task_id)
+  record = load_json(path, None, strict=True)
   if not isinstance(record, dict):
+    if path.exists():
+      raise ValueError(f"Task record must be a JSON object: {path}; original file preserved")
     if required:
       known = ", ".join(item["id"] for item in load_tasks(am)) or "(none)"
       die(T("e.unknown_task", id=task_id, known=known))
@@ -661,14 +664,19 @@ def current_session(agent: str) -> dict:
   return {"id": "", "path": "", "source": "none"}
 
 
-def read_lease(am: Path, task_id: str) -> dict | None:
+def read_lease(am: Path, task_id: str, *, strict: bool = False) -> dict | None:
   """Return a lease if it exists, annotated with liveness."""
-  lease = load_json(lease_path(am, task_id), None)
+  path = lease_path(am, task_id)
+  lease = load_json(path, None, strict=strict)
   if not isinstance(lease, dict):
+    if strict and path.exists():
+      raise ValueError(f"Lease must be a JSON object: {path}; original file preserved")
     return None
   try:
     expires = datetime.fromisoformat(lease["expires"])
-  except (KeyError, ValueError):
+  except (KeyError, ValueError, TypeError):
+    if strict:
+      raise ValueError(f"Invalid lease expiry: {path}; original file preserved")
     lease["live"] = False
     return lease
   lease["live"] = expires > now()
@@ -1210,12 +1218,16 @@ def collapse_observations(items: list[dict]) -> list[tuple[dict, int]]:
 # can stop showing them, which is the part that was actually annoying.
 
 
-def hidden_state(am: Path) -> dict:
+def hidden_state(am: Path, *, strict: bool = False) -> dict:
   """Return the ``{short_id: {at, why}}`` map of suppressed sessions."""
-  data = load_json(am / "hidden.json", {})
+  data = load_json(am / "hidden.json", {}, strict=strict)
   if not isinstance(data, dict):
+    if strict:
+      raise ValueError("Hidden state must be a JSON object; original file preserved")
     return {}
-  hidden = data.get("hidden")
+  hidden = data.get("hidden", {})
+  if strict and not isinstance(hidden, dict):
+    raise ValueError("Hidden entries must be a JSON object; original file preserved")
   return hidden if isinstance(hidden, dict) else {}
 
 
@@ -1227,7 +1239,7 @@ def hide_sessions(am: Path, shorts: list[str], why: str, state: bool = True) -> 
   process died halfway through.
   """
   with store_lock(am):
-    data = hidden_state(am)
+    data = hidden_state(am, strict=True)
     stamp = iso(now())
     for short in shorts:
       key = str(short).strip()
@@ -3954,7 +3966,9 @@ def renew_lease(am: Path, cfg: dict, task_id: str | None, agent: str, session_id
   if not task_id:
     return
   path = lease_path(am, task_id)
-  lease = load_json(path, None)
+  lease = load_json(path, None, strict=True)
+  if lease is not None and not isinstance(lease, dict):
+    raise ValueError(f"Lease must be a JSON object: {path}; original file preserved")
   if not isinstance(lease, dict) or lease.get("agent") != agent:
     return
   if lease.get("session") and session_id and lease.get("session") != session_id:
@@ -4031,7 +4045,7 @@ def claim_record(am: Path, cfg: dict, args: argparse.Namespace, record: dict,
       die(T("e.already_done", id=record["id"]))
     if record.get("status") == "cancelled":
       die(f"task '{record['id']}' is cancelled")
-    lease = read_lease(am, record["id"])
+    lease = read_lease(am, record["id"], strict=True)
     mine = bool(lease) and lease.get("agent") == args.agent
     if mine and lease.get("session") and session["id"]:
       mine = lease["session"] == session["id"]
@@ -4097,7 +4111,7 @@ def cmd_release(am: Path, cfg: dict, args: argparse.Namespace) -> int:
   with store_lock(am):
     record = get_task(am, args.id)
     assert record is not None
-    lease = read_lease(am, record["id"])
+    lease = read_lease(am, record["id"], strict=True)
     if lease and lease.get("agent") != args.agent and not args.force:
       die(f"lease on '{record['id']}' belongs to {lease.get('agent')}, not {args.agent}")
     lease_path(am, record["id"]).unlink(missing_ok=True)
@@ -4275,16 +4289,16 @@ def cmd_delegate(am: Path, cfg: dict, args: argparse.Namespace) -> int:
     fcntl.flock(lock, fcntl.LOCK_EX)
     key = packet["source_id"]
     path = directory / (key + ".json")
-    previous = load_json(path, {})
+    previous = load_json(path, {}, strict=True)
     if not isinstance(previous, dict):
-      previous = {}
+      raise ValueError("Delegate snapshot must be a JSON object; original file preserved")
+    ids = load_json(directory / "index.json", [], strict=True)
+    if not isinstance(ids, list):
+      raise ValueError("Delegate index must be a JSON list; original file preserved")
     if previous.get("revision", 0) == packet["revision"] and previous != packet:
       die("Conflicting delegate revision")
     if previous.get("revision", 0) < packet["revision"]:
       save_json(path, packet)
-    ids = load_json(directory / "index.json", [])
-    if not isinstance(ids, list):
-      ids = []
     if key not in ids:
       save_json(directory / "index.json", ids + [key])
   print(json.dumps({"source_id": key, "revision": max(packet["revision"], previous.get("revision", 0)),
@@ -4921,4 +4935,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-  raise SystemExit(main())
+  try:
+    raise SystemExit(main())
+  except (ValueError, OSError) as exc:
+    die(f"Operation refused: {exc}")
