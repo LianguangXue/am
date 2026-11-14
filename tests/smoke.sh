@@ -104,6 +104,21 @@ grep -q 'id="pane"' "$WORK/page.html" || fail "dashboard page did not render"
 ! grep -q '__PROJECT__' "$WORK/page.html" || fail "dashboard did not substitute the project name"
 ok "dashboard serves state and page"
 
+curl -fsS "http://127.0.0.1:$PORT/api/delegate" -o "$WORK/delegate.json" || fail "delegate status API"
+python3 - "$WORK/delegate.json" <<'PY' || fail "delegate status API contract"
+import json, sys
+data = json.load(open(sys.argv[1]))
+assert isinstance(data["jobs"], list)
+assert data["inference_calls"] == 0
+assert data["limit"] == 100
+PY
+curl -fsS -H 'Accept-Encoding: gzip' "http://127.0.0.1:$PORT/" -o "$WORK/page.gz" || fail "gzip dashboard"
+python3 - "$WORK/page.gz" "$WORK/page.html" <<'PY' || fail "gzip roundtrip"
+import gzip, pathlib, sys
+assert gzip.decompress(pathlib.Path(sys.argv[1]).read_bytes()) == pathlib.Path(sys.argv[2]).read_bytes()
+PY
+ok "independent delegate status and compressed page"
+
 # Bulk suppression is what the dashboard's multi-select posts to; the ids do not
 # have to correspond to real sessions for the endpoint contract to be checked.
 curl -fsS -X POST -H 'Content-Type: application/json' \

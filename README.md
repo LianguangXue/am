@@ -10,6 +10,12 @@ finished.
 No daemon, no database, no API keys. The core is a stdlib-only Python CLI plus a directory; the optional work protocol
 ships in the adjacent `bin/am_work.py` module.
 
+The 0.5 dashboard includes a dedicated **Delegate 子任务** workspace (`/#delegate`):
+live status/phase, model and effort, heartbeat, observed tokens, errors and exact
+parent-session links. Filter by activity, attention, provider or search text. It reads
+bounded local indexes without invoking models or requiring an am task binding.
+See [dashboard usage](docs/DASHBOARD.zh-CN.md). The existing memory store is preserved.
+
 ```
 $ am brief --for codex
 

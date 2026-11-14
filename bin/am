@@ -27,8 +27,13 @@ Usage is documented in ``.agents/DESIGN.md``.
 from __future__ import annotations
 
 import argparse
+from collections.abc import Iterator
+import contextlib
+import copy
+import fcntl
 import functools
 import gzip
+import hmac
 import json
 import os
 import re
@@ -36,12 +41,14 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import urllib.parse
 from datetime import datetime, timedelta
 from pathlib import Path
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 
 EVENT_TYPES = ("goal", "task", "claim", "decision", "cmd", "result", "blocker", "next", "done", "note")
 LEASE_DEFAULT_MIN = 45
@@ -254,6 +261,7 @@ MSG: dict[str, dict[str, str]] = {
   "c.released": {"en": "released {id}", "zh": "已释放 {id}"},
   "c.done": {"en": "done {id}", "zh": "已完成 {id}"},
   "c.blocked": {"en": "blocked {id}", "zh": "已标记受阻 {id}"},
+  "c.cancelled": {"en": "cancelled {id}", "zh": "已取消 {id}"},
   "c.logged": {"en": "logged {t} → {task}", "zh": "已记录 {t} → {task}"},
   "c.no_task": {"en": "(no task)", "zh": "（无任务）"},
   "c.next": {"en": "next step recorded for {id}", "zh": "已记录 {id} 的下一步"},
@@ -356,9 +364,12 @@ def detect_agent() -> str:
     return "dsh"
   if os.environ.get("CLAUDECODE") or os.environ.get("CLAUDE_CODE_ENTRYPOINT"):
     return "claude-code"
-  if any(key.startswith("CODEX_") for key in os.environ):
+  codex_config_vars = {"CODEX_HOME", "CODEX_SQLITE_HOME", "CODEX_CONFIG_DIR"}
+  if any(key.startswith("CODEX_") and key not in codex_config_vars for key in os.environ):
     return "codex"
-  return "unknown"
+  if os.environ.get("ANTIGRAVITY_AGENT") or os.environ.get("ANTIGRAVITY_CONVERSATION_ID"):
+    return "antigravity"
+  return "human"
 
 
 def slug(text: str) -> str:
@@ -406,31 +417,105 @@ def resolve_am(explicit: str | None) -> Path:
   raise AssertionError("unreachable")
 
 
-def load_json(path: Path, default: object) -> object:
-  """Read a JSON file, returning ``default`` when absent or unreadable."""
+def atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
+  """Atomically write text via a unique temp file in the target directory.
+
+  Args:
+    path: Destination file path.
+    text: Text content to write.
+    encoding: Text encoding name.
+  """
+  path.parent.mkdir(parents=True, exist_ok=True)
+  fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+  tmp_path = Path(tmp_name)
+  try:
+    with os.fdopen(fd, "w", encoding=encoding) as handle:
+      handle.write(text)
+    os.replace(tmp_path, path)
+  except BaseException:
+    tmp_path.unlink(missing_ok=True)
+    raise
+
+
+_STORE_LOCK_META = threading.Lock()
+_STORE_THREAD_LOCKS: dict[str, threading.RLock] = {}
+_STORE_LOCK_DEPTH: dict[tuple[str, int], tuple[int, object]] = {}
+
+
+@contextlib.contextmanager
+def store_lock(am: Path) -> Iterator[None]:
+  """Acquire an advisory cross-process and re-entrant thread lock for ``am``.
+
+  Args:
+    am: Path to the ``.agents`` store directory.
+
+  Yields:
+    None while the exclusive lock is held.
+  """
+  am.mkdir(parents=True, exist_ok=True)
+  key = str(am.resolve())
+  with _STORE_LOCK_META:
+    rlock = _STORE_THREAD_LOCKS.setdefault(key, threading.RLock())
+  tid = threading.get_ident()
+  rlock.acquire()
+  handle = None
+  depth_key = (key, tid)
+  try:
+    depth, existing = _STORE_LOCK_DEPTH.get(depth_key, (0, None))
+    if depth == 0:
+      handle = (am / ".lock").open("a+", encoding="utf-8")
+      fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+      _STORE_LOCK_DEPTH[depth_key] = (1, handle)
+    else:
+      _STORE_LOCK_DEPTH[depth_key] = (depth + 1, existing)
+    yield
+  finally:
+    cur_depth, cur_handle = _STORE_LOCK_DEPTH.get(depth_key, (0, handle))
+    if cur_depth <= 1:
+      _STORE_LOCK_DEPTH.pop(depth_key, None)
+      if cur_handle is not None:
+        try:
+          fcntl.flock(cur_handle.fileno(), fcntl.LOCK_UN)
+        finally:
+          cur_handle.close()
+    else:
+      _STORE_LOCK_DEPTH[depth_key] = (cur_depth - 1, cur_handle)
+    rlock.release()
+
+
+def load_json(path: Path, default: object, *, strict: bool = False) -> object:
+  """Read a JSON file, returning ``default`` when absent or (unless ``strict``) unreadable.
+
+  Args:
+    path: JSON file path to read.
+    default: Fallback value copied when missing or unreadable.
+    strict: Re-raise JSON, Unicode, or OS errors other than FileNotFoundError.
+
+  Returns:
+    Decoded JSON value, or a deep copy of ``default``.
+  """
   try:
     with path.open(encoding="utf-8") as handle:
       return json.load(handle)
   except FileNotFoundError:
-    return default
-  except json.JSONDecodeError as exc:
-    die(f"corrupt JSON in {path}: {exc}")
+    return copy.deepcopy(default)
+  except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
+    if strict:
+      raise
+    print(f"warning: ignoring unreadable JSON in {path}: {exc}", file=sys.stderr)
+    return copy.deepcopy(default)
 
 
 def save_json(path: Path, payload: object) -> None:
   """Atomically write JSON so a crash cannot leave a half-written file."""
-  path.parent.mkdir(parents=True, exist_ok=True)
-  tmp = path.with_suffix(path.suffix + ".tmp")
-  with tmp.open("w", encoding="utf-8") as handle:
-    json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
-    handle.write("\n")
-  os.replace(tmp, path)
+  atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
 
 
 def load_config(am: Path) -> dict:
   """Return the store configuration, filling in defaults."""
   cfg = load_json(am / "config.json", {})
-  assert isinstance(cfg, dict)
+  if not isinstance(cfg, dict):
+    cfg = {}
   cfg.setdefault("project", am.parent.name)
   cfg.setdefault("lease_minutes", LEASE_DEFAULT_MIN)
   cfg.setdefault("brief_tokens", BRIEF_DEFAULT_TOKENS)
@@ -529,8 +614,10 @@ def find_session_path(agent: str, session: str) -> str:
     if name != agent or not base.is_dir():
       continue
     for path in base.glob(pattern):
+      if "subagents" in path.parts:
+        continue
       stem = path.parent.name if path.suffix == ".zstd" else path.stem
-      if stem == session:
+      if stem == session or (agent == "codex" and stem.endswith(f"-{session}")):
         return str(path)
   return ""
 
@@ -538,14 +625,21 @@ def find_session_path(agent: str, session: str) -> str:
 def current_session(agent: str) -> dict:
   """Best-effort identity of the session that is calling right now.
 
-  DSH puts its session id in the environment. Claude Code and Codex do not, so
-  the caller's own transcript file is the signal: the session running this
-  command wrote that file seconds ago, so the newest file for the agent inside a
-  short window is almost always it. With several sessions of the same agent
-  alive at once this can pick the wrong one, which is why every command that
-  records a session also accepts an explicit ``--session``.
+  DSH, Codex, and Antigravity can expose session identifiers in the
+  environment; Claude Code does not reliably do so, so we fall back to the
+  newest transcript file for ``agent`` inside a short window. Subagent
+  transcript directories are excluded so nested workers never shadow the
+  parent session.
   """
-  env = os.environ.get("DSH_SESSION_ID")
+  env = ""
+  if agent == "dsh":
+    env = os.environ.get("DSH_SESSION_ID", "")
+  elif agent == "antigravity":
+    env = os.environ.get("ANTIGRAVITY_CONVERSATION_ID", "")
+  elif agent == "codex":
+    env = os.environ.get("CODEX_THREAD_ID") or os.environ.get("CODEX_SESSION_ID", "")
+  elif agent == "claude-code":
+    env = os.environ.get("CLAUDE_SESSION_ID", "")
   if env:
     return {"id": env, "path": find_session_path(agent, env), "source": "env"}
   newest, newest_path = 0.0, None
@@ -553,6 +647,8 @@ def current_session(agent: str) -> dict:
     if name != agent or not base.is_dir():
       continue
     for path in base.glob(pattern):
+      if "subagents" in path.parts:
+        continue
       try:
         mtime = path.stat().st_mtime
       except OSError:
@@ -629,6 +725,38 @@ def select_target(am: Path, agent: str) -> dict | None:
 # JSONL transcripts, so tailing them needs no hook, no plugin and no cooperation
 # from the dying process. This is the part that keeps the store honest when an
 # agent is killed mid-turn without writing a single `am` command.
+
+
+_GLOB_CACHE_LOCK = threading.Lock()
+_GLOB_CACHE: dict[tuple[str, str], tuple[float, list[Path]]] = {}
+_GLOB_TTL_S = 1.5
+
+
+def _iter_transcript_paths(base: Path, pattern: str, ttl: float = _GLOB_TTL_S) -> list[Path]:
+  """List transcript files under ``base`` matching ``pattern``, skipping subagents.
+
+  Args:
+    base: Root directory for an agent's transcript store.
+    pattern: Glob pattern relative to ``base``.
+    ttl: Cache lifetime in seconds for repeated in-process scans.
+
+  Returns:
+    Candidate transcript paths excluding ``subagents`` directories.
+  """
+  if not base.is_dir():
+    return []
+  key = (str(base), pattern)
+  stamp = time.monotonic()
+  with _GLOB_CACHE_LOCK:
+    hit = _GLOB_CACHE.get(key)
+    if hit is not None and stamp - hit[0] < ttl:
+      return hit[1]
+  paths = [path for path in base.glob(pattern) if "subagents" not in path.parts]
+  with _GLOB_CACHE_LOCK:
+    if len(_GLOB_CACHE) >= 32:
+      _GLOB_CACHE.clear()
+    _GLOB_CACHE[key] = (stamp, paths)
+  return paths
 
 
 def transcript_sources() -> list[tuple[str, Path, str]]:
@@ -906,9 +1034,7 @@ def append_tail(am: Path, agent: str, records: list[dict]) -> int:
   lines = kept + [json.dumps(item, ensure_ascii=False, sort_keys=True) for item in records]
   if len(lines) > TAIL_KEEP:
     lines = lines[-TAIL_KEEP:]
-  tmp = path.with_suffix(".tmp")
-  tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
-  os.replace(tmp, path)
+  atomic_write_text(path, "\n".join(lines) + "\n")
   return len(records)
 
 
@@ -917,7 +1043,8 @@ def watch_scan(am: Path, days: float = 3.0, max_sessions: int = 24, all_scopes: 
 
   Runs implicitly before ``brief``/``status``/``handoff`` so a successor always
   sees what the dead agent was doing, without anyone having to keep a daemon
-  alive. Bounded by modification time and session count to stay fast.
+  alive. Bounded by modification time, unchanged file metadata, and session count
+  to stay fast on shared filesystems.
   """
   state = load_watch_state(am)
   files = state.get("files") if isinstance(state.get("files"), dict) else {}
@@ -925,40 +1052,53 @@ def watch_scan(am: Path, days: float = 3.0, max_sessions: int = 24, all_scopes: 
   root = am.parent
   slug = scope_slug(root)
   total = 0
+  pending: list[tuple[str, str, str, int, dict, list[dict]]] = []
 
   for agent, base, pattern in transcript_sources():
-    if not base.is_dir():
-      continue
-    candidates: list[tuple[float, Path]] = []
-    for path in base.glob(pattern):
+    candidates: list[tuple[float, int, Path]] = []
+    for path in _iter_transcript_paths(base, pattern):
       if not all_scopes and not session_in_scope(agent, path, am.parent, slug):
         continue
       try:
-        mtime = path.stat().st_mtime
+        info = path.stat()
       except OSError:
         continue
-      if mtime < cutoff:
+      if info.st_mtime < cutoff:
         continue
-      candidates.append((mtime, path))
+      candidates.append((info.st_mtime, info.st_size, path))
     candidates.sort(reverse=True)
 
-    for mtime, path in candidates[:max_sessions]:
+    for mtime, size, path in candidates[:max_sessions]:
       key = str(path)
       cursor = files.get(key) if isinstance(files.get(key), dict) else {}
+      if cursor.get("mtime") == mtime and cursor.get("size") == size:
+        continue
       if path.suffix == ".zstd":
         since = int(cursor.get("last_seq") or 0)
-        records, cursor = _scan_zstd(path, agent, since)
+        records, new_cursor = _scan_zstd(path, agent, since)
+        marker_field, expected_prev = "last_seq", since
       else:
         offset = int(cursor.get("offset") or 0)
-        records, offset = _scan_plain(path, agent, offset)
-        cursor = {"offset": offset}
-      cursor["mtime"] = mtime
-      files[key] = cursor
-      total += append_tail(am, agent, records)
+        records, new_offset = _scan_plain(path, agent, offset)
+        new_cursor = {"offset": new_offset}
+        marker_field, expected_prev = "offset", offset
+      new_cursor["mtime"] = mtime
+      new_cursor["size"] = size
+      pending.append((key, agent, marker_field, expected_prev, new_cursor, records))
 
-  state["files"] = files
-  state["last_scan"] = iso(now())
-  save_json(am / ".watch.json", state)
+  if pending or not state.get("last_scan"):
+    with store_lock(am):
+      fresh = load_watch_state(am)
+      fresh_files = fresh.get("files") if isinstance(fresh.get("files"), dict) else {}
+      for key, agent, marker_field, expected_prev, new_cursor, records in pending:
+        cur = fresh_files.get(key) if isinstance(fresh_files.get(key), dict) else {}
+        if int(cur.get(marker_field) or 0) != expected_prev:
+          continue
+        fresh_files[key] = new_cursor
+        total += append_tail(am, agent, records)
+      fresh["files"] = fresh_files
+      fresh["last_scan"] = iso(now())
+      save_json(am / ".watch.json", fresh)
   return total
 
 
@@ -1086,19 +1226,20 @@ def hide_sessions(am: Path, shorts: list[str], why: str, state: bool = True) -> 
   rewrite per id would leave the store readable in a half-applied state if the
   process died halfway through.
   """
-  data = hidden_state(am)
-  stamp = iso(now())
-  for short in shorts:
-    key = str(short).strip()
-    if not key:
-      continue
-    if state:
-      data[key] = {"at": stamp, "why": why}
-    else:
-      data.pop(key, None)
-  save_json(am / "hidden.json", {"hidden": data})
-  DASHBOARD_CACHE["at"] = 0.0
-  return len(data)
+  with store_lock(am):
+    data = hidden_state(am)
+    stamp = iso(now())
+    for short in shorts:
+      key = str(short).strip()
+      if not key:
+        continue
+      if state:
+        data[key] = {"at": stamp, "why": why}
+      else:
+        data.pop(key, None)
+    save_json(am / "hidden.json", {"hidden": data})
+    DASHBOARD_CACHE["at"] = 0.0
+    return len(data)
 
 
 def hide_session(am: Path, short: str, why: str, state: bool = True) -> int:
@@ -1222,7 +1363,15 @@ def read_recent_lines(path: Path, max_bytes: int = 2_000_000) -> list[str]:
       blob = handle.read()
   except OSError:
     return []
-  return blob.decode("utf-8", "replace").splitlines()
+  lines = blob.decode("utf-8", "replace").splitlines()
+  if size > max_bytes and not any(line.strip() for line in lines):
+    tail_bytes: list[bytes] = []
+    for raw in iter_lines_reversed(path):
+      tail_bytes.append(raw)
+      if len(tail_bytes) >= 400:
+        break
+    return [item.decode("utf-8", "replace") for item in reversed(tail_bytes)]
+  return lines
 
 
 def iter_lines_reversed(path: Path, block: int = 262_144):
@@ -1573,13 +1722,17 @@ def session_digest(agent: str, path: Path, scan_lines: int = 300_000) -> dict:
 def short_session(agent: str, stem: str) -> str:
   """Return a short, unambiguous handle for a session id.
 
-  DSH prefixes its ids with ``session-`` and Codex with a full timestamp, so a
-  naive first-eight-characters handle collapses every session to ``session-`` or
-  ``rollout-``. Take the identifying part instead.
+  DSH prefixes its ids with ``session-`` and Codex transcripts use
+  ``rollout-<timestamp>-<uuid>`` while runtime env vars carry bare ``<uuid>``.
+  Extracting the UUID's trailing random segment for both Codex forms keeps
+  handles consistent across transcript discovery and task leases without
+  colliding on UUIDv7 timestamp prefixes.
   """
   if stem.startswith("session-"):
     stem = stem[len("session-"):]
-  if stem.startswith("rollout-"):
+  if stem.startswith("rollout-") or (
+      agent == "codex" and re.fullmatch(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", stem)
+  ):
     stem = stem.rsplit("-", 1)[-1]
   return re.sub(r"[^A-Za-z0-9]", "", stem)[:8] or stem[:8]
 
@@ -1613,13 +1766,7 @@ def recent_sessions(am: Path, days: float = 7.0, limit: int = 8,
   slug = scope_slug(am.parent)
   rows: list[dict] = []
   for agent, base, pattern in transcript_sources():
-    if not base.is_dir():
-      continue
-    for path in base.glob(pattern):
-      # Subagent transcripts live under `<session>/subagents/`. They are not
-      # sessions a person starts, and at 1250 of them they drown the real list.
-      if "subagents" in path.parts:
-        continue
+    for path in _iter_transcript_paths(base, pattern):
       if not session_in_scope(agent, path, am.parent, slug):
         continue
       try:
@@ -1768,24 +1915,30 @@ def cmd_adopt(am: Path, cfg: dict, args: argparse.Namespace) -> int:
   """Turn a discovered session into a task and bind this session to it."""
   rows = recent_sessions(am, args.days, 60)
   key = re.sub(r"[^A-Za-z0-9]", "", args.session).lower()
+  raw_lower = args.session.lower()
   match = [row for row in rows
-           if str(row.get("short", "")).lower().startswith(key) or row["session"].startswith(args.session)]
+           if str(row.get("short", "")).lower().startswith(key)
+           or row["session"].lower().startswith(raw_lower)
+           or (len(raw_lower) >= 6 and raw_lower in row["session"].lower())]
   if not match:
     die(T("e.no_session", v=args.session))
   row = match[0]
   task_id = args.id or ("s-" + str(row.get("short") or "task").lower())
   title = args.title or clip(row.get("prompt") or row["session"], 90)
-  record = get_task(am, task_id, required=False)
-  if record is None:
-    record = {"id": task_id, "created": iso(now()), "status": "open", "owner": None,
-              "title": title, "accept": args.accept or "", "spec": "",
-              "session": row["session"], "session_path": row["path"], "agent": row["agent"]}
-    save_task(am, record)
-    append_event(am, base_event(args, "task", f"task `{task_id}`: {title}", task=task_id))
-    print(T("c.adopted", id=task_id, agent=row["agent"], quiet=row["quiet"]))
-  else:
-    print(T("c.started_existing", id=task_id))
-  return claim_record(am, cfg, args, record)
+  session = caller_session(args)
+  with store_lock(am):
+    record = get_task(am, task_id, required=False)
+    if record is None:
+      record = {"id": task_id, "created": iso(now()), "status": "open", "owner": None,
+                "title": title, "accept": args.accept or "", "spec": "",
+                "session": row["session"], "session_path": row["path"], "agent": row["agent"]}
+      save_task(am, record)
+      append_event(am, base_event(args, "task", f"task `{task_id}`: {title}",
+                                  task=task_id, session_id=session["id"]))
+      print(T("c.adopted", id=task_id, agent=row["agent"], quiet=row["quiet"]))
+    else:
+      print(T("c.started_existing", id=task_id))
+    return claim_record(am, cfg, args, record, session=session)
 
 
 # --------------------------------------------------------------------- recall
@@ -1870,10 +2023,8 @@ def recall_scan(am: Path, terms: list[str], days: float, max_sessions: int,
   for agent, base, pattern in transcript_sources():
     if agent_filter and agent != agent_filter:
       continue
-    if not base.is_dir():
-      continue
     candidates: list[tuple[float, Path]] = []
-    for path in base.glob(pattern):
+    for path in _iter_transcript_paths(base, pattern):
       if not all_scopes and not session_in_scope(agent, path, am.parent, slug):
         continue
       try:
@@ -2001,70 +2152,242 @@ DASHBOARD_CACHE: dict[str, object] = {"at": 0.0, "payload": None, "scanned": 0.0
 
 
 DELEGATE_VIEW_CACHE: dict = {}
+DELEGATE_RECORD_CACHE: dict = {}
+DELEGATE_VIEW_LOCK = threading.RLock()
+DELEGATE_ACTIVE = {"queued", "running", "cancelling", "orphaned", "archiving"}
+
+_SECRET_PEM_RE = re.compile(
+  r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)"
+)
+_SECRET_URL_RE = re.compile(r"(https?://[^/\s:@]+):[^/\s@]+@")
+_SECRET_TOKEN_RE = re.compile(
+  r"(?i)Bearer\s+[^\s\"',;]+|\bsk-[A-Za-z0-9_-]+|\bgh[pousr]_[A-Za-z0-9_]{12,}"
+  r"|\bgithub_pat_[A-Za-z0-9_]{12,}|\bxox[baprs]-[A-Za-z0-9-]{8,}"
+  r"|\bAIza[0-9A-Za-z_-]{20,}|\bAKIA[0-9A-Z]{16}\b"
+)
+_SECRET_LABELS_RE = re.compile(
+  r"""(?is)(\b(?:api[_-]?key|(?:(?:access|refresh|auth|id|session|csrf)[_-]?)?token"""
+  r"""|password|passwd|(?:api|client|jwt|webhook|app)[_-]?secret|authorization|cookie|private[_-]?key)["']?\s*[:=]\s*).+"""
+)
+
+
+def scrub_secrets(text: str) -> str:
+  """Redact common tokens, private keys, and labeled secrets from free text.
+
+  Args:
+    text: Input text to sanitize before exposing via HTTP or briefings.
+
+  Returns:
+    Sanitized text with secret values replaced by ``[REDACTED]``.
+  """
+  if not text:
+    return text
+  text = _SECRET_PEM_RE.sub("[REDACTED]", text)
+  text = _SECRET_URL_RE.sub(r"\1:[REDACTED]@", text)
+  text = _SECRET_TOKEN_RE.sub("[REDACTED]", text)
+  return _SECRET_LABELS_RE.sub(r"\1[REDACTED]", text)
 
 
 def delegate_overview(cfg: dict) -> dict:
-  """Read a bounded index of local delegate jobs, without importing or changing them."""
+  """Read current indexed jobs with bounded I/O; never call or mutate a worker."""
+  with DELEGATE_VIEW_LOCK:
+    return _delegate_overview(cfg)
+
+
+def _delegate_overview(cfg: dict) -> dict:
+  """Prioritize active jobs, then recent indexed history, caching unchanged records."""
   root = Path(cfg.get("delegate_state_dir") or os.environ.get("DELEGATE_STATE_DIR") or
-              Path.home() / ".claude/delegate").expanduser()
+              Path.home() / ".claude/delegate").expanduser().resolve()
+  stamp = time.time()
   key = str(root)
   cached = DELEGATE_VIEW_CACHE.get(key)
-  if cached and time.time() - cached[0] < 15:
+  if cached and stamp - cached[0] < 2:
     return cached[1]
-  def read(path: Path):
+  def valid(value):
+    return isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,100}", value)
+  def read(path: Path, ttl: float = 2):
     import stat
+    hit = DELEGATE_RECORD_CACHE.get(str(path))
+    if hit and stamp - hit[0] < ttl:
+      return hit[2]
     fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
     with os.fdopen(fd, "rb") as stream:
-      if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+      info = os.fstat(stream.fileno())
+      if not stat.S_ISREG(info.st_mode):
         raise ValueError("overview records must be regular files")
+      fingerprint = (info.st_ino, info.st_mtime_ns, info.st_size)
+      if hit and hit[1] == fingerprint:
+        DELEGATE_RECORD_CACHE[str(path)] = (stamp, fingerprint, hit[2])
+        return hit[2]
       raw = stream.read(2_000_001)
     if len(raw) > 2_000_000:
       raise ValueError("record exceeds overview read limit")
-    return json.loads(raw)
-  result = {"jobs": [], "source": str(root), "errors": 0,
-            "coverage": "最近20个delegate任务，最多50次执行；只读概览，不表示已关联am"}
+    value = json.loads(raw)
+    if len(DELEGATE_RECORD_CACHE) >= 512:
+      DELEGATE_RECORD_CACHE.pop(next(iter(DELEGATE_RECORD_CACHE)))
+    DELEGATE_RECORD_CACHE[str(path)] = (stamp, fingerprint, value)
+    return value
+  def number(value):
+    import math
+    return value if type(value) in {int, float} and 0 <= value <= 9_007_199_254_740_991 and math.isfinite(value) else None
+  def safe_text(value, limit=500):
+    def clean(item, depth=0):
+      if depth > 12:
+        return "[omitted]"
+      if isinstance(item, dict):
+        return {key: "[REDACTED]" if re.search(r"token|api.?key|password|authorization|secret|cookie", key, re.I)
+                else clean(val, depth+1) for key,val in item.items()}
+      if isinstance(item, list):
+        return [clean(val, depth+1) for val in item[:64]]
+      if isinstance(item, str):
+        return scrub_secrets(item)
+      return number(item) if type(item) in {int,float} else item
+    text = scrub_secrets(value) if isinstance(value, str) else json.dumps(clean(value), ensure_ascii=False) if value else ""
+    return text[:limit]
+  def age(value):
+    value = number(value)
+    return round(max(0, stamp - value), 1) if value is not None else None
   try:
+    boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+  except OSError:
+    boot = None
+  def alive(record):
+    if not isinstance(record, dict) or type(record.get("pid")) is not int or record["pid"] < 1 or boot is None:
+      return None
+    if record.get("boot") != boot:
+      return None  # Shared stores can contain a live worker on another host.
+    try:
+      fields = Path(f"/proc/{record['pid']}/stat").read_text().rsplit(")", 1)[1].split()
+      return fields[0] != "Z" and fields[19] == str(record.get("start")) and record.get("boot") == boot
+    except (OSError, IndexError):
+      return False
+  result = {"jobs": [], "source": str(root), "errors": 0, "sampled_at": stamp, "limit": 100,
+            "inference_calls": 0, "truncated": False,
+            "coverage": "优先活动索引 + 最近40个任务，最多100次执行；只读状态，不自动关联或唤醒 agent"}
+  tasks, sessions, candidates = {}, {}, []
+  try:
+    try:
+      active = read(root / "active.json")
+      if not isinstance(active, list):
+        raise ValueError("invalid active index")
+      candidates.extend((jid, None) for jid in active[-64:] if valid(jid))
+      if len(active) > 64:
+        result["truncated"] = True
+    except FileNotFoundError:
+      pass
+    except (OSError, ValueError, TypeError):
+      result["errors"] += 1
     ids = read(root / "task-index.json")
     if not isinstance(ids, list):
       raise ValueError("invalid task index")
-    seen = set()
-    for tid in reversed(ids[-20:]):
-      if not isinstance(tid, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", tid):
+    for tid in reversed(ids[-40:]):
+      if not valid(tid):
         continue
       try:
         task = read(root / ("task-" + tid + ".json"))
-        if task.get("id") != tid or not isinstance(task.get("session_id"), str) or not task["session_id"]:
+        if not isinstance(task, dict) or task.get("id") != tid or not valid(task.get("session_id")):
           raise ValueError("task identity mismatch")
-        for jid in reversed(task.get("jobs", [])[-50:]):
-          if len(seen) >= 50:
-            break
-          if not isinstance(jid, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", jid) or jid in seen:
-            continue
-          seen.add(jid)
-          try:
-            job = read(root / ("job-" + jid + ".json"))
-            if job.get("id") != jid or job.get("task_id") != tid or job.get("session_id") != task["session_id"]:
-              result["errors"] += 1
-              continue
-            archive = job.get("cli_session") or job.get("codex_session") or {}
-            result["jobs"].append({k: job.get(k) for k in
-              ("id", "session_id", "task_id", "work_item", "provider_name", "model", "effort", "status", "review", "collected_at")} |
-              {"conversation": archive.get("status", "unknown"),
-               "has_thread": bool(job.get("thread_id"))})
-          except (OSError, ValueError, TypeError, AttributeError):
-            result["errors"] += 1
-          if len(seen) >= 50:
-            break
+        if not isinstance(task.get("jobs", []), list):
+          raise ValueError("invalid task job index")
+        tasks[tid] = task
+        candidates.extend((jid, tid) for jid in reversed(task.get("jobs", [])[-100:]) if valid(jid))
       except (OSError, ValueError, TypeError, AttributeError):
         result["errors"] += 1
-      if len(seen) >= 50:
-        break
   except FileNotFoundError:
     result["note"] = "尚未找到本机delegate任务索引"
   except (OSError, ValueError, TypeError):
     result["note"] = "无法读取delegate任务索引"
     result["errors"] += 1
-  DELEGATE_VIEW_CACHE[key] = (time.time(), result)
+  seen = set()
+  for jid, expected_task in candidates:
+    if jid in seen:
+      continue
+    if len(seen) >= 100:
+      result["truncated"] = True
+      break
+    seen.add(jid)
+    try:
+      job = read(root / ("job-" + jid + ".json"))
+      tid = job.get("task_id")
+      if not valid(tid) or (expected_task and tid != expected_task):
+        raise ValueError("job task mismatch")
+      if tid not in tasks:
+        tasks[tid] = read(root / ("task-" + tid + ".json"))
+      task = tasks[tid]
+      sid = job.get("session_id")
+      if (job.get("id") != jid or not valid(sid) or task.get("id") != tid
+          or sid != task.get("session_id") or jid not in task.get("jobs", [])):
+        raise ValueError("job ownership mismatch")
+      if sid not in sessions:
+        try:
+          sessions[sid] = read(root / ("session-" + sid + ".json"))
+        except FileNotFoundError:
+          sessions[sid] = {}
+      parent = sessions[sid]
+      archive = job.get("cli_session") or job.get("codex_session") or {}
+      running = job.get("status") in DELEGATE_ACTIVE
+      wait = job.get("worker_wait") or {}
+      heartbeat_age = age(job.get("heartbeat"))
+      worker_alive = alive(job.get("worker_identity")) if running else None
+      warnings = []
+      if running and worker_alive is False:
+        warnings.append("worker 身份已不在；记录可能未及时收尾，请先检查")
+      if running and heartbeat_age is not None and heartbeat_age > 30:
+        warnings.append("心跳超过30秒未更新；不等于计算失败")
+      if job.get("status") == "orphaned":
+        warnings.append("后端清理尚未确认，请勿直接重复派发写任务")
+      raw = job.get("usage_delta") if job.get("provider", {}).get("kind") == "codex" else job.get("usage")
+      tokens = cached_tokens = None
+      if isinstance(raw, dict):
+        codex = job.get("provider", {}).get("kind") == "codex"
+        keys = ("inputTokens", "outputTokens") if codex else ("input_tokens", "output_tokens")
+        if all(number(raw.get(k)) is not None for k in keys):
+          tokens = sum(raw[k] for k in keys)
+          cached_tokens = raw.get("cachedInputTokens", 0) if codex else raw.get("cache_read_input_tokens", 0)
+          if not codex:
+            tokens += sum(number(raw.get(k)) or 0 for k in ("cache_read_input_tokens", "cache_creation_input_tokens"))
+      start = number(job.get("execution_started_at")) or number(job.get("created_at"))
+      finish = stamp if running else number(job.get("finished_at"))
+      result["jobs"].append({k: job.get(k) if isinstance(job.get(k), str) else None for k in
+        ("id", "session_id", "task_id", "work_item", "agent", "provider_name", "model", "effort", "status", "review",
+         "phase", "last_event", "progress_event", "inference_state", "failure_kind")} |
+        {"conversation": archive.get("status") if isinstance(archive.get("status"), str) else "unknown",
+         "created_at": number(job.get("created_at")), "finished_at": number(job.get("finished_at")),
+         "collected_at": number(job.get("collected_at")), "has_thread": bool(job.get("thread_id")),
+         "label": safe_text(job.get("work_item") or task.get("label") or jid, 160),
+         "parent_host": parent.get("host_kind") if isinstance(parent.get("host_kind"), str) else "claude-code",
+         "elapsed_seconds": round(max(0, finish - start), 1) if start is not None and finish is not None else None,
+         "heartbeat_age_seconds": heartbeat_age, "progress_age_seconds": age(job.get("last_progress_at")),
+         "worker_alive": worker_alive, "backend_alive": alive(job.get("backend_identity")) if running else None,
+         "waiting": wait.get("state") == "waiting", "wait_state": wait.get("state") if isinstance(wait.get("state"), str) else None,
+         "active_commands": len(job.get("active_commands") or []), "observed_tokens": number(tokens), "cached_tokens": number(cached_tokens),
+         "error": safe_text(job.get("error")), "warnings": warnings,
+         "workspace_status": safe_text((job.get("workspace_setup") or {}).get("status"), 80)})
+    except (OSError, ValueError, TypeError, AttributeError, KeyError):
+      result["errors"] += 1
+  result["jobs"].sort(key=lambda j: (j.get("status") not in DELEGATE_ACTIVE, -(number(j.get("created_at")) or 0)))
+  result["counts"] = {"shown": len(result["jobs"]),
+    "active": sum(j.get("status") in DELEGATE_ACTIVE for j in result["jobs"]),
+    "waiting": sum(j["waiting"] and j.get("status") in DELEGATE_ACTIVE for j in result["jobs"]),
+    "attention": sum(j.get("status") in {"failed", "timed_out", "orphaned"}
+                     or j.get("review") in {"needs-work", "blocked"} or bool(j["warnings"]) for j in result["jobs"]),
+    "completed": sum(j.get("status") == "completed" for j in result["jobs"])}
+  if len(DELEGATE_VIEW_CACHE) >= 8:
+    DELEGATE_VIEW_CACHE.pop(next(iter(DELEGATE_VIEW_CACHE)))
+  DELEGATE_VIEW_CACHE[key] = (stamp, result)
+  return result
+
+
+def dashboard_session_ids(row: dict) -> list[str]:
+  """Match exact Claude IDs and the native-host hashes without guessing short IDs."""
+  import hashlib
+  native = str(row.get("session") or "")
+  match = re.search(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$", native)
+  if row.get("agent") == "codex" and native.startswith("rollout-") and match:
+    native = match[0]
+  result = [native] if native else []
+  if row.get("agent") in {"codex", "dsh"} and native:
+    result.append(row["agent"] + "-" + hashlib.sha256(native.encode()).hexdigest()[:32])
   return result
 
 
@@ -2077,31 +2400,36 @@ def state_payload(am: Path, cfg: dict, ttl: float = 3.0) -> dict:
   because the expensive part is reading transcripts, not assembling the payload.
   """
   stamp = time.time()
-  if DASHBOARD_CACHE["payload"] is not None and stamp - float(DASHBOARD_CACHE["at"]) < ttl:
+  cache_key = (str(am.resolve()), cfg.get("delegate_state_dir"), cfg.get("dashboard_days"))
+  if (DASHBOARD_CACHE.get("key") == cache_key and DASHBOARD_CACHE["payload"] is not None
+      and stamp - float(DASHBOARD_CACHE["at"]) < ttl):
     return DASHBOARD_CACHE["payload"]  # type: ignore[return-value]
 
   if stamp - float(DASHBOARD_CACHE["scanned"]) > 60:
     try:
       watch_scan(am)
-    except Exception:
+    except OSError:
       pass
     DASHBOARD_CACHE["scanned"] = stamp
 
   tasks = []
   for item in load_tasks(am):
     lease = read_lease(am, item["id"]) or {}
+    lease_agent = str(lease.get("agent") or item.get("owner") or "")
+    lease_session = str(lease.get("session") or "")
     tasks.append({
       "id": item.get("id"),
-      "title": item.get("title") or "",
+      "title": scrub_secrets(str(item.get("title") or "")),
       "status": item.get("status"),
       "owner": item.get("owner") or lease.get("agent") or "",
-      "session": str(lease.get("session") or ""),
+      "session": lease_session,
+      "session_short": short_session(lease_agent, lease_session) if lease_session else "",
       "lease_min": lease.get("remaining_min"),
       "quiet": lease.get("last_seen_min"),
       "idle": bool(lease.get("idle")),
-      "next": item.get("next") or "",
-      "accept": item.get("accept") or "",
-      "evidence": item.get("evidence") or "",
+      "next": scrub_secrets(str(item.get("next") or "")),
+      "accept": scrub_secrets(str(item.get("accept") or "")),
+      "evidence": scrub_secrets(str(item.get("evidence") or "")),
       "delegate": delegate_summary(am, item["id"]),
     })
 
@@ -2115,9 +2443,12 @@ def state_payload(am: Path, cfg: dict, ttl: float = 3.0) -> dict:
     wf = row.get("workflow") or {}
     sessions.append({
       "short": row["short"], "agent": row["agent"], "quiet": row["quiet"],
-      "title": row.get("title") or "", "intent": row.get("intent") or "",
-      "asked": row.get("asked") or "", "progress": row.get("progress") or "",
-      "action": row.get("action") or "",
+      "delegate_session_ids": dashboard_session_ids(row),
+      "title": scrub_secrets(str(row.get("title") or "")),
+      "intent": scrub_secrets(str(row.get("intent") or "")),
+      "asked": scrub_secrets(str(row.get("asked") or "")),
+      "progress": scrub_secrets(str(row.get("progress") or "")),
+      "action": scrub_secrets(str(row.get("action") or "")),
       "workflow": {k: wf.get(k) for k in
                    ("name", "status", "error", "phases", "reached", "accepted",
                     "rejected", "missing", "killed", "idle_min", "rejects",
@@ -2126,8 +2457,12 @@ def state_payload(am: Path, cfg: dict, ttl: float = 3.0) -> dict:
 
   hidden_rows = []
   for row in [r for r in scanned if r["short"] in suppressed]:
-    hidden_rows.append({"short": row["short"], "agent": row["agent"], "quiet": row["quiet"],
-                        "title": row.get("title") or "", "why": (suppressed[row["short"]] or {}).get("why", "")})
+    hidden_rows.append({
+      "short": row["short"], "agent": row["agent"], "quiet": row["quiet"],
+      "delegate_session_ids": dashboard_session_ids(row),
+      "title": scrub_secrets(str(row.get("title") or "")),
+      "why": scrub_secrets(str((suppressed[row["short"]] or {}).get("why", ""))),
+    })
 
   active = [row for row in sessions if row["quiet"] <= 5]
   holders = {task["owner"] for task in tasks if task["status"] in ("claimed", "open")}
@@ -2160,6 +2495,7 @@ def state_payload(am: Path, cfg: dict, ttl: float = 3.0) -> dict:
   }
   DASHBOARD_CACHE["payload"] = payload
   DASHBOARD_CACHE["at"] = time.time()
+  DASHBOARD_CACHE["key"] = cache_key
   return payload
 
 
@@ -2336,15 +2672,57 @@ DASHBOARD_HTML = r"""<!doctype html>
          background:#16202e;border:1px solid #28405c;color:var(--fg);padding:8px 16px;border-radius:9px;
          font-size:12.5px;opacity:0;pointer-events:none;transition:opacity .18s,transform .18s}
   .toast.on{opacity:1;transform:translateX(-50%) translateY(0)}
+  :root{--bg:#0b0f17;--panel:#121a27;--panel2:#192336;--line:#233047;--line2:#30415c;
+    --mid:#bec9da;--dim:#91a0b7;--faint:#8391a8;--accent:#8eb4ff;--ok:#5bdfb5}
+  .bar{height:58px;background:#101724;padding:0 24px}
+  .brand{font-size:19px;gap:10px}.brand small{font-size:11px;font-weight:500;color:var(--dim);margin-left:4px}
+  .shell{height:calc(100vh - 58px);grid-template-columns:278px minmax(0,1fr)}
+  .side{background:#0e1521}.grp{background:#0e1521;letter-spacing:.08em}
+  .side-top{padding:16px 13px 12px}.nav{padding:8px 12px 24px}
+  .item{padding:9px 10px;margin:3px 0}.item.on{background:#1c2c47;border-color:#304c76}
+  .delegate-entry{margin-bottom:15px;background:#14243a;border-color:#233d5d}
+  .mini-badge{font:10px var(--mono);padding:1px 5px;border-radius:5px;color:var(--accent);background:#1b304c}
+  .pane{padding:30px 34px 70px;background:radial-gradient(800px 420px at 90% 0%,#14223a60,transparent),var(--bg)}
+  .pane h1{font-size:28px;letter-spacing:-.035em}.eyebrow{font-size:11px;font-weight:700;letter-spacing:.15em;color:var(--accent);margin-bottom:8px}
+  .page-head{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;margin-bottom:8px}
+  .tile{border-radius:14px;background:linear-gradient(145deg,#172235,#101824);padding:18px 20px}
+  .tile span{display:block;margin-top:5px;letter-spacing:.03em;font-size:12px}.tile b{font-size:30px}
+  .sec-t{font-size:12px;letter-spacing:.03em;color:var(--mid);margin-top:28px}
+  .row{padding:16px;border-radius:12px;background:#121b29}.row .nx{white-space:normal;overflow-wrap:anywhere}
+  .delegate-toolbar{display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap;margin:22px 0 16px}
+  .filter-tabs{display:flex;gap:6px;flex-wrap:wrap}.filter-tabs .btn.on{background:#233d61;color:#d8e6ff;border-color:#476da3}
+  .delegate-toolbar select{background:var(--panel);color:var(--fg);border:1px solid var(--line2);border-radius:8px;padding:8px 10px;font:inherit;font-size:12px}
+  .delegate-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,360px),1fr));gap:14px;margin-top:14px}
+  .delegate-card{border:1px solid var(--line);border-radius:14px;background:linear-gradient(145deg,#162236,#101925);padding:18px;min-width:0;
+    content-visibility:auto;contain-intrinsic-size:auto 240px}
+  .delegate-card.is-active{border-top:2px solid var(--ok)}.delegate-card.needs-attention{border-top:2px solid var(--warn)}
+  .delegate-card h3{font-size:14px;margin:0;line-height:1.6;font-weight:650;overflow-wrap:anywhere}
+  .job-top{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:12px}
+  .job-meta{display:flex;gap:6px;flex-wrap:wrap;align-items:center;color:var(--dim);font-size:11.5px;margin-top:6px}
+  .job-model{font:12px var(--mono);color:#d3e2ff;overflow-wrap:anywhere}.job-phase{font-size:13px;color:var(--fg);margin-top:14px}
+  .job-measures{display:flex;gap:18px;flex-wrap:wrap;margin:14px 0;color:var(--mid);font-size:12px}
+  .job-measures span small{display:block;color:var(--dim);font-size:10.5px;margin-bottom:2px}
+  .job-parent{display:flex;gap:7px;align-items:center;color:var(--dim);font-size:11.5px;flex-wrap:wrap;margin-top:12px}
+  .job-parent .btn{font-size:11px;padding:3px 7px}.job-warning{font-size:11.5px;color:#f4cc88;background:#36291880;padding:8px 10px;border-radius:8px;margin-top:12px;overflow-wrap:anywhere}
+  .job-details{font-size:12px;margin-top:14px;border-top:1px solid var(--line);padding-top:10px;color:var(--dim)}
+  .job-details summary{cursor:pointer;color:var(--mid)}.job-details dl{display:grid;grid-template-columns:66px minmax(0,1fr);gap:6px 10px;margin:12px 0 0}
+  .job-details dt{color:var(--dim)}.job-details dd{margin:0;overflow-wrap:anywhere;font:11px/1.7 var(--mono)}
+  .section-head{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-top:28px}.section-head h2{font-size:15px;margin:0}
+  .source-note{font-size:11.5px;color:var(--dim);margin-top:12px;overflow-wrap:anywhere}.source-note .chip{margin-right:6px}
+  .loading{padding:30px;color:var(--dim)}.chip{white-space:nowrap}.btn{transition:background .12s,border-color .12s}
+  button:focus-visible,select:focus-visible,summary:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+  @media (prefers-reduced-motion:reduce){.brand .dot{animation:none}*{scroll-behavior:auto!important}}
   @media (max-width:820px){ .shell{grid-template-columns:1fr;height:auto}
-    .side{border-right:none;border-bottom:1px solid var(--line);max-height:42vh} }
+    .side{border-right:none;border-bottom:1px solid var(--line);max-height:42vh}
+    .pane{padding:22px 16px 50px}.bar{padding:0 14px}.brand small,.stats{display:none}.delegate-grid{grid-template-columns:1fr} }
 </style></head>
 <body>
 <header class="bar">
-  <div class="brand"><span class="dot"></span>am</div>
+  <div class="brand"><span class="dot"></span>am <small>Agent workspace</small></div>
   <div class="proj">__PROJECT__</div>
   <div class="spacer"></div>
   <div class="stats" id="stats"></div>
+  <button class="icon" id="refresh" title="立即刷新任务与会话">刷新</button>
   <button class="icon" id="pause" title="暂停自动刷新（快捷键 p）">暂停</button>
   <div class="clock" id="stamp">…</div>
 </header>
@@ -2353,7 +2731,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     <div class="side-top">
       <div class="find">
         <span style="color:var(--faint);font-size:12px">⌕</span>
-        <input id="q" placeholder="搜索会话 / 标题 / 内容" autocomplete="off">
+        <input id="q" aria-label="搜索会话和子任务" placeholder="搜索会话、子任务、模型" autocomplete="off">
         <kbd>/</kbd>
       </div>
       <div class="tools">
@@ -2368,7 +2746,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       <button class="btn ghost" id="pick-clear">取消</button>
     </div>
   </aside>
-  <main class="pane" id="pane"></main>
+  <main class="pane" id="pane"><div class="loading">正在连接工作区…</div></main>
 </div>
 <div class="toast" id="toast"></div>
 <script>
@@ -2378,13 +2756,51 @@ const dur = m => m < 90 ? m + 'm' : (m < 2160 ? Math.floor(m/60) + 'h' : Math.fl
 const chip = (c,t) => `<span class="chip ${c}">${esc(t)}</span>`;
 const live = q => q <= 2 ? 'live' : (q <= 15 ? 'idle' : '');
 const AGENTS = ['claude-code','codex','dsh'];
+const DELEGATE_VIEW = '__delegate__';
+const ACTIVE_JOBS = new Set(['queued','running','cancelling','orphaned','archiving']);
+const STATUS_NAMES = {queued:'排队中',running:'执行中',cancelling:'取消中',orphaned:'待检查',archiving:'归档中',completed:'执行完成',failed:'失败',timed_out:'超时',cancelled:'已取消'};
+const PHASE_NAMES = {'runtime-preflight':'检查运行版本','preparing-worktree':'准备工作树','workspace-ready':'工作区就绪',initializing:'连接模型','thread/start':'建立对话','thread/resume':'恢复对话','turn/start':'提交模型任务',executing:'执行任务'};
+const duration = seconds => seconds == null ? '未知' : seconds < 60 ? Math.floor(seconds)+'秒' : seconds < 3600 ? Math.floor(seconds/60)+'分'+Math.floor(seconds%60)+'秒' : Math.floor(seconds/3600)+'时'+Math.floor(seconds%3600/60)+'分';
+const formatNumber = n => n == null ? '未提供' : Number(n).toLocaleString('zh-CN');
+const clockTime = value => value ? new Date(value).toLocaleTimeString('zh-CN',{hour12:false}) : '—';
 
-const S = { q:'', sel:null, showHidden:false, paused:false, data:null, sig:'', closed:new Set(),
-            batch:false, picked:new Set() };
+const S = { q:'', sel:location.hash==='#delegate'?DELEGATE_VIEW:null, showHidden:false, paused:false, data:null, sig:'', closed:new Set(),
+            batch:false, picked:new Set(), delegateFilter:'all', delegateProvider:'', delegateLimit:24, stateLoading:false, jobsLoading:false };
+const AM_TOKEN = new URLSearchParams(location.search).get('token') || '';
+const apiHeaders = extra => Object.assign({}, AM_TOKEN ? {'X-AM-Token': AM_TOKEN} : {}, extra || {});
 
 function toast(msg){ const t=document.getElementById('toast'); t.textContent=msg; t.classList.add('on');
   clearTimeout(toast._t); toast._t=setTimeout(()=>t.classList.remove('on'),1400); }
-function copy(text){ if(navigator.clipboard) navigator.clipboard.writeText(text); toast('已复制 ' + text); }
+async function copy(text){
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text);
+      toast('已复制 ' + text);
+      return;
+    }
+  } catch (_) { /* HTTP and denied permissions need the selection fallback. */ }
+  const previous = document.activeElement;
+  const field = document.createElement('textarea');
+  field.value = text;
+  field.readOnly = true;
+  field.style.cssText = 'position:fixed;left:-9999px;top:0;font-size:16px';
+  let copied = false;
+  try {
+    document.body.append(field);
+    field.select();
+    field.setSelectionRange(0, field.value.length);
+    copied = document.execCommand('copy');
+  } catch (_) { /* Some browsers disable both clipboard methods. */ }
+  finally {
+    field.remove();
+    if (previous && previous.focus) previous.focus({preventScroll:true});
+  }
+  if (copied) toast('已复制 ' + text);
+  else {
+    toast('自动复制失败，请手动复制');
+    window.prompt('请复制下面的内容：', text);
+  }
+}
 
 function matches(r){
   if (!S.q) return true;
@@ -2412,12 +2828,14 @@ function navRow(r, muted){
   const main = (S.data.main||{}).short === r.short;
   const name = r.title || r.progress || r.short;
   const picked = S.picked.has(r.short);
+  const jobs = jobsForSession(r), activeJobs = jobs.filter(j=>ACTIVE_JOBS.has(j.status)).length;
   const mark = S.batch
     ? `<span class="pick ${picked?'on':''}"></span>`
     : `<span class="dot ${muted?'':live(r.quiet)}"></span>`;
   return `<button class="item ${S.sel===r.short?'on':''} ${muted?'muted':''} ${main?'main':''} ${picked?'picked':''}"
       data-short="${esc(r.short)}" ${muted?'data-hidden="1"':''}>${mark}
       <span class="nm">${esc(cut(name, 26))}</span>
+      ${jobs.length?`<span class="mini-badge" title="子任务：活动 ${activeJobs} / 当前读取 ${jobs.length}">↳ ${activeJobs||jobs.length}</span>`:''}
       <span class="q">${wf || (muted ? '隐藏' : dur(r.quiet))}</span></button>`;
 }
 
@@ -2426,6 +2844,10 @@ function renderNav(){
   let html = `<button class="item ${S.sel===null?'on':''}" data-short="">
       <span class="nm" style="font-weight:600">概览</span>
       <span class="q">${(S.data.tasks||[]).filter(t=>['open','claimed','blocked'].includes(t.status)).length}</span></button>`;
+  const counts = delegateCounts();
+  html += `<button class="item delegate-entry ${S.sel===DELEGATE_VIEW?'on':''}" data-view="delegate">
+    <span class="dot ${counts.active?'live':''}"></span><span class="nm">Delegate 子任务</span>
+    <span class="mini-badge">${counts.active} 活动 / ${counts.shown}</span></button>`;
   html += groups.map(g => {
     const closed = S.closed.has(g.agent);
     return `<div class="grp ${closed?'closed':''}" data-g="${esc(g.agent)}">${esc(g.agent)}
@@ -2438,9 +2860,11 @@ function renderNav(){
     if (S.showHidden) html += hidden.length ? hidden.map(r=>navRow(r,true)).join('')
       : `<div class="nav-empty">没有匹配的隐藏会话</div>`;
   }
-  if (!groups.length && !S.q) html += `<div class="nav-empty">最近 ${S.data.window_days||30} 天没有会话</div>`;
+  if (S.data.session_loading) html += `<div class="nav-empty">会话载入中，子任务可先查看</div>`;
+  else if (!groups.length && !S.q) html += `<div class="nav-empty">最近 ${S.data.window_days||30} 天没有会话</div>`;
   if (!groups.length && S.q) html += `<div class="nav-empty">没有匹配「${esc(S.q)}」的会话</div>`;
-  document.getElementById('nav').innerHTML = html;
+  const nav=document.getElementById('nav');
+  if(nav._rendered!==html){const top=nav.scrollTop;nav.innerHTML=html;nav._rendered=html;nav.scrollTop=top;}
   syncBulkUI();
 }
 
@@ -2465,7 +2889,7 @@ function setBatch(on){
 async function hideMany(shorts, undo=false){
   const ids = [...new Set(shorts)].filter(Boolean);
   if (!ids.length) return;
-  await fetch('/api/hide', {method:'POST', headers:{'Content-Type':'application/json'},
+  await fetch('/api/hide', {method:'POST', headers:apiHeaders({'Content-Type':'application/json'}),
     body: JSON.stringify({shorts: ids, undo, why:'ui'})});
   toast(`${undo ? '已恢复' : '已隐藏'} ${ids.length} 个会话`);
   S.picked.clear(); S.batch = false;
@@ -2513,15 +2937,102 @@ function openMenu(x, y, short, hidden){
 
 function tile(n,label,cls){ return `<div class="tile ${cls||''}"><b>${n}</b><span>${esc(label)}</span></div>`; }
 
+function delegateJobs(){ return S.data?.delegate_overview?.jobs || []; }
+function jobAttention(j){ return ['failed','timed_out','orphaned'].includes(j.status) || ['needs-work','blocked'].includes(j.review) || (j.warnings||[]).length>0; }
+function delegateCounts(){
+  const jobs=delegateJobs();
+  return {shown:jobs.length,active:jobs.filter(j=>ACTIVE_JOBS.has(j.status)).length,
+    attention:jobs.filter(jobAttention).length,completed:jobs.filter(j=>j.status==='completed').length};
+}
+function jobsForSession(s){
+  const ids=s.delegate_session_ids || [];
+  return delegateJobs().filter(j=>ids.includes(j.session_id));
+}
+function parentForJob(j){
+  const rows=[...(S.data?.sessions||[]),...(S.data?.hidden||[])].filter(s=>(s.delegate_session_ids||[]).includes(j.session_id));
+  return rows.length===1?rows[0]:null;
+}
+function drawPane(html){
+  const pane=document.getElementById('pane');
+  if(pane._rendered===html) return;
+  const opened=new Set([...pane.querySelectorAll('details[data-job][open]')].map(e=>e.dataset.job));
+  pane.innerHTML=html;pane._rendered=html;
+  for(const detail of pane.querySelectorAll('details[data-job]')) if(opened.has(detail.dataset.job)) detail.open=true;
+}
+function jobCard(j){
+  const active=ACTIVE_JOBS.has(j.status), attention=jobAttention(j), parent=parentForJob(j);
+  const state=j.waiting && active?'等待计算':STATUS_NAMES[j.status]||j.status||'状态未知';
+  const color=attention?'warn':active?'acc':j.status==='completed'?'ok':'ghost';
+  const phase=j.waiting && active?'等待文件或进程 · 等待工具不调用模型':PHASE_NAMES[j.phase]||j.phase||'暂无阶段事件';
+  const review={accepted:'已验收','needs-work':'需返工',blocked:'验收受阻',pending:'待验收'}[j.review]||j.review||'待验收';
+  const time=value=>value?new Date(value*1000).toLocaleString('zh-CN',{hour12:false}):'—';
+  const kv=(name,value)=>`<dt>${esc(name)}</dt><dd>${esc(value??'—')}</dd>`;
+  return `<article class="delegate-card ${active?'is-active':''} ${attention?'needs-attention':''}" data-job-card="${esc(j.id)}">
+    <div class="job-top"><div><h3>${esc(j.label||j.work_item||j.id)}</h3>
+      <div class="job-meta">${esc(j.agent||j.provider_name||'未知角色')} · ${esc(j.provider_name||'未知后端')}</div></div>${chip(color,state)}</div>
+    <div class="job-model">${esc(j.model||'模型未记录')} <span class="chip ghost">${esc(j.effort||'effort 未记录')}</span></div>
+    <div class="job-phase">${active?'':'最后阶段 · '}${esc(phase)}</div>
+    <div class="job-measures"><span><small>运行时长</small>${duration(j.elapsed_seconds)}</span>
+      <span><small>心跳距今</small>${active?duration(j.heartbeat_age_seconds):'已结束'}</span>
+      <span><small>本次 tokens</small>${formatNumber(j.observed_tokens)}</span>
+      ${active && j.active_commands?`<span><small>运行命令</small>${j.active_commands}</span>`:''}</div>
+    <div class="job-meta">${chip(j.review==='accepted'?'ok':'ghost',review)} ${chip('ghost',j.collected_at?'结果已读取':'结果未读取')}
+      ${j.conversation==='archived'?chip('ghost','对话已归档'):''}</div>
+    <div class="job-parent">主会话 ${parent?`<button class="btn ghost" data-jump="${esc(parent.short)}">${esc(cut(parent.title||parent.short,28))} ↗</button>`:
+      `<code title="${esc(j.session_id)}">${esc(cut(j.session_id,24))}</code><span>未匹配 am 会话</span>`}</div>
+    ${(j.warnings||[]).map(w=>`<div class="job-warning">${esc(w)}</div>`).join('')}
+    ${j.error?`<div class="job-warning">${j.failure_kind==='infrastructure'?'基础设施：':''}${esc(j.error)}</div>`:''}
+    <details class="job-details" data-job="${esc(j.id)}"><summary>任务详情与诊断</summary><dl>
+      ${kv('任务 ID',j.id)}${kv('工作项',j.work_item)}${kv('主会话',j.session_id)}
+      ${kv('创建',time(j.created_at))}${kv('结束',time(j.finished_at))}
+      ${kv('最近事件',j.last_event||j.progress_event)}${kv('事件距今',duration(j.progress_age_seconds))}
+      ${kv('worker',j.worker_alive==null?'未观测':j.worker_alive?'存活':'身份已不在')}
+      ${kv('后端',j.backend_alive==null?'未观测':j.backend_alive?'存活':'身份已不在')}
+      ${kv('工作区',j.workspace_status)}${kv('缓存 token',formatNumber(j.cached_tokens))}
+    </dl><div class="acts"><button class="btn ghost" data-copy="${esc(j.id)}">复制任务 ID</button>
+      <button class="btn ghost" data-copy="${esc(j.session_id)}">复制主会话 ID</button></div></details>
+  </article>`;
+}
+function delegateSection(jobs,heading='Delegate 子任务'){
+  return `<div class="section-head"><h2>${esc(heading)} <span class="chip ghost">${jobs.length}</span></h2>
+    <button class="btn ghost" data-view="delegate">查看全部子任务 ↗</button></div>`+
+    (jobs.length?`<div class="delegate-grid">${jobs.map(jobCard).join('')}</div>`:
+      `<div class="empty-box" style="margin-top:14px">当前读取范围内没有该会话的子任务。不需要先绑定 am 任务；可在全部子任务中检查其他主会话。</div>`);
+}
+function renderDelegates(){
+  const overview=S.data.delegate_overview||{},counts=delegateCounts(),all=delegateJobs();
+  const filters={all:['全部',counts.shown],active:['活动',counts.active],attention:['需关注',counts.attention],completed:['执行完成',counts.completed]};
+  const providers=[...new Set(all.map(j=>j.provider_name).filter(Boolean))].sort();
+  if(S.delegateProvider && !providers.includes(S.delegateProvider)) S.delegateProvider='';
+  let jobs=all.filter(j=>S.delegateFilter==='active'?ACTIVE_JOBS.has(j.status):S.delegateFilter==='attention'?jobAttention(j):S.delegateFilter==='completed'?j.status==='completed':true);
+  if(S.delegateProvider) jobs=jobs.filter(j=>j.provider_name===S.delegateProvider);
+  if(S.q){const q=S.q.toLowerCase();jobs=jobs.filter(j=>[j.id,j.label,j.session_id,j.model,j.effort,j.agent,j.provider_name,j.status,j.phase,STATUS_NAMES[j.status]].join(' ').toLowerCase().includes(q));}
+  const shown=jobs.slice(0,S.delegateLimit);
+  let h=`<div class="page-head"><div><div class="eyebrow">DELEGATE · LIVE ACTIVITY</div><h1>子任务工作台</h1>
+    <div class="sub">跨模型执行进展，按主会话归属展示。执行完成与验收分别记录。</div></div>${chip('ok','只读 · 零模型调用')}</div>
+    <div class="tiles">${tile(counts.active,'活动任务','live')}${tile(counts.attention,'需要关注','warn')}${tile(counts.completed,'执行完成','acc')}${tile(counts.shown,'当前读取')}</div>
+    <div class="delegate-toolbar"><div class="filter-tabs">${Object.entries(filters).map(([key,[label,n]])=>
+      `<button class="btn ${S.delegateFilter===key?'on':''}" data-job-filter="${key}" aria-pressed="${S.delegateFilter===key}">${label} ${n}</button>`).join('')}</div>
+      <select id="delegate-provider" aria-label="筛选子任务后端"><option value="">全部后端</option>${providers.map(p=>`<option value="${esc(p)}" ${p===S.delegateProvider?'selected':''}>${esc(p)}</option>`).join('')}</select></div>
+    <div class="source-note">${esc(overview.coverage||'当前索引中的任务')} · 自动刷新约 2.5 秒</div>`;
+  if(overview.errors||overview.truncated) h+=`<div class="job-warning">${overview.errors?`${overview.errors} 项记录无法读取。`:''}${overview.truncated?'已达到读取上限。':''}当前清单可能不完整。</div>`;
+  h+=shown.length?`<div class="delegate-grid">${shown.map(jobCard).join('')}</div>`:
+    `<div class="empty-box" style="margin-top:18px">${esc(all.length?'没有匹配当前筛选条件的子任务。':overview.note||'尚无 delegate 子任务记录。')}</div>`;
+  if(jobs.length>shown.length) h+=`<div class="acts"><button class="btn" data-more-jobs>再显示 ${Math.min(24,jobs.length-shown.length)} 项</button><span class="sub">已显示 ${shown.length} / ${jobs.length}</span></div>`;
+  h+=`<details class="job-details"><summary>数据源与显示范围</summary><div class="source-note">${esc(overview.source||'未配置')}<br>只读任务索引；不扫描完整对话，不自动恢复或终止 agent。心跳和最近事件不等于任务完成百分比。</div></details>`;
+  drawPane(h);
+}
+
 function renderSummary(){
   const tasks = (S.data.tasks||[]).filter(t=>['open','claimed','blocked'].includes(t.status));
   const wfs = (S.data.sessions||[]).filter(s=>s.workflow && s.workflow.name);
   const main = S.data.main;
-  let h = `<h1>总体情况</h1><div class="sub">窗口 最近 ${S.data.window_days||30} 天 ·
-    生成于 ${esc((S.data.generated||'').slice(11,19))} · 库 ${esc(S.data.store)}</div>`;
+  let h = `<div class="eyebrow">WORKSPACE OVERVIEW</div><h1>工作区概览</h1><div class="sub">窗口 最近 ${S.data.window_days||30} 天 ·
+    更新于 ${esc(clockTime(S.data.generated))} · 库 ${esc(S.data.store||'载入中')}</div>`;
+  if(S.data.session_loading) h+=`<div class="source-note">会话列表加载中；Delegate 子任务监控已经可用。</div>`;
   h += `<div class="tiles">${tile(S.data.counts.active,'活跃会话','live')}
-    ${tile(tasks.length,'在飞任务','acc')}${tile(S.data.counts.sessions,'最近 ' + (S.data.window_days||30) + ' 天会话')}
-    ${tile(wfs.length,'工作流','warn')}</div>`;
+    ${tile(S.data.session_loading?'—':tasks.length,'在飞任务','acc')}${tile(S.data.counts.sessions,'最近 ' + (S.data.window_days||30) + ' 天会话')}
+    ${tile(S.data.session_loading?'—':wfs.length,'工作流','warn')}${tile(delegateCounts().active,'活动子任务','live')}</div>`;
 
   if (main) {
     h += `<div class="sec-t">当前主 agent</div><div class="row"><div class="m">
@@ -2531,27 +3042,19 @@ function renderSummary(){
       <div>${chip('ok','quiet '+dur(main.quiet))}</div></div>`;
   }
 
-  const dv = S.data.delegate_overview || {jobs:[]};
-  h += `<div class="sec-t">Delegate 子任务</div><div class="sub">${esc(dv.coverage||'')}
-    · 已关联am的任务 ${(S.data.tasks||[]).filter(t=>t.delegate?.shown).length}</div>`;
-  h += dv.jobs.length ? dv.jobs.map(j=>`<div class="row"><div class="m">
-    <div><span class="id">${esc(j.id)}</span> ${esc(j.work_item||'')}</div>
-    <div class="sub">${esc(j.provider_name||'')} · ${esc(j.model||'')} / ${esc(j.effort||'')}
-    · 验收 ${esc(j.review||'pending')} · 对话 ${esc(j.conversation)}</div>
-    ${j.has_thread && ['completed','failed','timed_out','cancelled'].includes(j.status)
-      ? `<div class="nx">可在所属主会话请求续接：/delegate resume ${esc(j.id)} &lt;后续任务&gt;</div>` : ''}
-    </div><div>${chip('ghost',j.status||'unknown')}</div></div>`).join('')
-    : `<div class="empty-box">${esc(dv.note||'尚无delegate子任务记录')}。关联后可在am任务卡中查看交接摘要。</div>`;
-  if (dv.errors) h += `<div class="sub">有 ${dv.errors} 项记录未能读取；上方不是完整清单。</div>`;
-
+  h += delegateSection(delegateJobs().slice(0,4));
   h += `<div class="sec-t">在飞任务</div>`;
   h += tasks.length ? tasks.map(t => {
-    const known = (S.data.sessions||[]).some(s=>s.short===t.session) ? t.session : null;
+    const match = (S.data.sessions||[]).find(s =>
+      s.short===t.session || s.short===t.session_short ||
+      (t.session && Array.isArray(s.delegate_session_ids) && s.delegate_session_ids.includes(t.session)));
+    const known = match ? match.short : null;
+    const shownSession = t.session_short || (t.session ? t.session.slice(0,13) : '');
     return `<div class="row"><div class="m">
       <div><span class="id">${esc(t.id)}</span><span class="ti">${esc(cut(t.title,64))}</span></div>
       <div class="sub" style="margin-top:4px">${esc(t.owner||'未认领')}${known
         ? ` / <span class="link" data-jump="${esc(known)}">${esc(known)}</span>`
-        : (t.session ? ' / ' + esc(t.session.slice(0,13)) : '')}</div>
+        : (shownSession ? ' / ' + esc(shownSession) : '')}</div>
       ${t.next ? `<div class="nx">→ ${esc(t.next)}</div>` : ''}
       ${t.delegate?.shown ? `<div class="sub">Delegate 摘要：运行 ${t.delegate.running} · 待读取 ${t.delegate.uncollected} · 待验收 ${t.delegate.awaiting_review} · 通过 ${t.delegate.accepted} · 返工 ${t.delegate.needs_work} · 状态冲突 ${t.delegate.conflicting}</div>` : '<div class="sub">尚未关联delegate交接记录</div>'}
     </div><div style="display:flex;flex-direction:column;gap:6px;align-items:flex-end">
@@ -2568,7 +3071,7 @@ function renderSummary(){
         ${w.missing?'· 未完成 '+w.missing.length:''}</div></div>
       <div>${chip(w.status==='failed'?'bad':w.status==='completed'?'ok':'warn', w.status)}</div></div>`;
   }).join('') : `<div class="empty-box">没有工作流记录。</div>`;
-  document.getElementById('pane').innerHTML = h;
+  drawPane(h);
 }
 
 function steps(w){
@@ -2621,39 +3124,63 @@ function renderDetail(short){
     ${s.asked?`<dt>最近提问</dt><dd>${esc(s.asked)}</dd>`:''}
     <dt>推进到</dt><dd>${esc(s.progress||'—')}</dd>
     ${s.action?`<dt>最后动作</dt><dd class="cmd" title="${esc(s.action)}">${esc(s.action)}</dd>`:''}</dl>`;
+  h+=delegateSection(jobsForSession(s),'这个会话的子任务');
   h+=workflowBlock(s.workflow);
-  document.getElementById('pane').innerHTML=h;
+  drawPane(h);
 }
 
 function renderPane(){
   const pane=document.getElementById('pane'), top=pane.scrollTop;
-  if(S.sel) renderDetail(S.sel); else renderSummary();
+  if(S.sel===DELEGATE_VIEW) renderDelegates(); else if(S.sel) renderDetail(S.sel); else renderSummary();
   pane.scrollTop=top;
 }
 
-function select(short){ S.sel=short||null; renderNav(); renderPane(); }
+function select(short){ S.sel=short||null; history.replaceState(null,'',location.pathname+location.search+(S.sel===DELEGATE_VIEW?'#delegate':'')); renderNav(); renderPane(); }
 
 async function toggleHide(short, undo){
-  await fetch('/api/hide',{method:'POST',headers:{'Content-Type':'application/json'},
+  await fetch('/api/hide',{method:'POST',headers:apiHeaders({'Content-Type':'application/json'}),
     body:JSON.stringify({short, undo, why:'ui'})});
   if(!undo && S.sel===short) S.sel=null;
   toast(undo?'已恢复':'已隐藏'); await tick(true);
 }
 
 async function tick(force){
-  if (S.paused && !force) return;
+  if ((S.paused || document.hidden) && !force || S.stateLoading) return;
+  S.stateLoading=true;
   try{
-    const d=await (await fetch('/api/state',{cache:'no-store'})).json();
-    document.getElementById('stamp').textContent=(d.generated||'').slice(11,19);
-    const sig=JSON.stringify([d.tasks,d.sessions,d.hidden,d.active,d.main&&d.main.short,d.counts]);
+    const response=await fetch('/api/state',{cache:'no-store',headers:apiHeaders()});
+    if(!response.ok) throw new Error('state unavailable');
+    const d=await response.json();
+    // An independently polled job update may be newer than this session snapshot.
+    if((S.data?.delegate_overview?.sampled_at||0)>(d.delegate_overview?.sampled_at||0)) d.delegate_overview=S.data.delegate_overview;
+    document.getElementById('stamp').textContent=clockTime(d.generated);
+    const sig=JSON.stringify([d.tasks,d.sessions,d.hidden,d.active,d.main&&d.main.short,d.counts,d.delegate_overview]);
     if(!force && sig===S.sig) return;
     S.sig=sig; S.data=d;
-    if(S.sel && ![...(d.sessions||[]),...(d.hidden||[])].some(r=>r.short===S.sel)) S.sel=null;
+    if(S.sel && S.sel!==DELEGATE_VIEW && ![...(d.sessions||[]),...(d.hidden||[])].some(r=>r.short===S.sel)) S.sel=null;
     document.getElementById('stats').innerHTML=
       `<span>活跃 <b>${d.counts.active}</b></span><span>任务 <b>${d.counts.tasks_open}</b></span>
        <span>会话 <b>${d.counts.sessions}</b></span>`;
     renderNav(); renderPane();
-  }catch(e){ document.getElementById('stamp').textContent='离线'; }
+  }catch(e){ document.getElementById('stamp').textContent='连接中断'; }
+  finally{S.stateLoading=false;}
+}
+
+async function tickDelegate(force){
+  if((S.paused || document.hidden) && !force || S.jobsLoading) return;
+  S.jobsLoading=true;
+  try{
+    const response=await fetch('/api/delegate',{cache:'no-store',headers:apiHeaders()});
+    if(!response.ok) throw new Error('delegate unavailable');
+    const overview=await response.json();
+    if(!S.data) S.data={tasks:[],sessions:[],hidden:[],active:[],counts:{active:'—',tasks_open:'—',sessions:'—'},session_loading:true};
+    if((overview.sampled_at||0)<(S.data.delegate_overview?.sampled_at||0)) return;
+    if(JSON.stringify(overview)===JSON.stringify(S.data.delegate_overview)) return;
+    S.data.delegate_overview=overview;
+    renderNav();renderPane();
+  }catch(e){
+    document.getElementById('stamp').textContent='子任务刷新失败';
+  }finally{S.jobsLoading=false;}
 }
 
 document.addEventListener('click', e => {
@@ -2661,6 +3188,10 @@ document.addEventListener('click', e => {
   // automation were hiding sessions during testing.
   const trusted = e.isTrusted !== false;
   const jump=e.target.closest('[data-jump]'); if(jump){ select(jump.dataset.jump); return; }
+  if(e.target.closest('[data-view="delegate"]')){select(DELEGATE_VIEW);return;}
+  const jobFilter=e.target.closest('[data-job-filter]');
+  if(jobFilter){S.delegateFilter=jobFilter.dataset.jobFilter;S.delegateLimit=24;renderPane();return;}
+  if(e.target.closest('[data-more-jobs]')){S.delegateLimit+=24;renderPane();return;}
   const cp=e.target.closest('[data-copy]'); if(cp){ copy(cp.dataset.copy); return; }
   const hd=e.target.closest('[data-hide]');
   if(hd){ if(!trusted) return; toggleHide(hd.dataset.hide, hd.dataset.undo==='1'); return; }
@@ -2724,22 +3255,26 @@ document.addEventListener('keydown', e => {
   }
 });
 
-document.getElementById('q').addEventListener('input', ev => { S.q = ev.target.value.trim(); renderNav(); });
+document.getElementById('q').addEventListener('input', ev => { S.q = ev.target.value.trim(); renderNav(); if(S.sel===DELEGATE_VIEW) renderPane(); });
+document.addEventListener('change',ev=>{if(ev.target.id==='delegate-provider'){S.delegateProvider=ev.target.value;S.delegateLimit=24;renderPane();}});
+document.getElementById('refresh').addEventListener('click',()=>{tick(true);tickDelegate(true);});
 document.getElementById('pause').addEventListener('click', () => {
   S.paused = !S.paused;
   const b = document.getElementById('pause');
   b.classList.toggle('on', S.paused);
   b.textContent = S.paused ? '已暂停' : '暂停';
-  if (!S.paused) tick(true);
+  if (!S.paused){tick(true);tickDelegate(true);}
 });
 
-tick(); setInterval(tick, 2500);
+document.addEventListener('visibilitychange',()=>{if(!document.hidden){tick(true);tickDelegate(true);}});
+tick(); tickDelegate(); setInterval(tick, 10000); setInterval(tickDelegate, 2500);
 </script></body></html>"""
 
 
 def dashboard_html(cfg: dict) -> str:
   """Return the single-page dashboard with the project name substituted."""
-  return DASHBOARD_HTML.replace("__PROJECT__", str(cfg.get("project") or "am"))
+  from html import escape
+  return DASHBOARD_HTML.replace("__PROJECT__", escape(str(cfg.get("project") or "am")))
 
 
 def cmd_serve(am: Path, cfg: dict, args: argparse.Namespace) -> int:
@@ -2747,54 +3282,128 @@ def cmd_serve(am: Path, cfg: dict, args: argparse.Namespace) -> int:
   from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
   page = dashboard_html(cfg).encode("utf-8")
+  compressed_page = gzip.compress(page, compresslevel=5)
   state_lock = threading.Lock()
+  token = str(getattr(args, "token", "") or os.environ.get("AM_DASHBOARD_TOKEN") or "")
+  if not token and args.host not in ("127.0.0.1", "::1", "localhost"):
+    print(f"warning: binding dashboard to {args.host} without --token / AM_DASHBOARD_TOKEN",
+          file=sys.stderr)
 
   class Handler(BaseHTTPRequestHandler):
+    timeout = 15
+
+    def _authorized(self) -> bool:
+      if not token:
+        return True
+      auth = (self.headers.get("Authorization") or "").strip()
+      if auth.lower().startswith("bearer ") and hmac.compare_digest(auth[7:].strip(), token):
+        return True
+      hdr = (self.headers.get("X-AM-Token") or "").strip()
+      if hdr and hmac.compare_digest(hdr, token):
+        return True
+      qs = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query, keep_blank_values=False)
+      qtoken = (qs.get("token") or [""])[0]
+      if qtoken and hmac.compare_digest(qtoken, token):
+        return True
+      self.send_error(401)
+      return False
+
     def do_GET(self):  # noqa: N802 - stdlib naming
-      if self.path.startswith("/api/state"):
-        with state_lock:
-          body = json.dumps(state_payload(am, cfg), ensure_ascii=False).encode("utf-8")
+      if not self._authorized():
+        return
+      route = urllib.parse.urlsplit(self.path).path
+      if route == "/api/delegate":
+        body = json.dumps(delegate_overview(cfg), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         kind = "application/json; charset=utf-8"
-      elif self.path in ("/", "/index.html"):
+      elif route == "/api/state":
+        with state_lock:
+          body = json.dumps(state_payload(am, cfg), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        kind = "application/json; charset=utf-8"
+      elif route in ("/", "/index.html"):
         body, kind = page, "text/html; charset=utf-8"
       else:
         self.send_error(404)
         return
+      accepts_gzip = any(part.split(";", 1)[0].strip() == "gzip" and
+                         not re.search(r";\s*q=0(?:\.0*)?(?:\s*;|\s*$)", part)
+                         for part in self.headers.get("Accept-Encoding", "").lower().split(","))
+      compressed = accepts_gzip and len(body) > 1024
+      if compressed:
+        body = compressed_page if kind.startswith("text/html") else gzip.compress(body, compresslevel=5)
       self.send_response(200)
       self.send_header("Content-Type", kind)
       self.send_header("Content-Length", str(len(body)))
       self.send_header("Cache-Control", "no-store")
+      self.send_header("Vary", "Accept-Encoding")
+      if compressed:
+        self.send_header("Content-Encoding", "gzip")
       self.end_headers()
       self.wfile.write(body)
 
     def do_POST(self):  # noqa: N802 - stdlib naming
-      if not self.path.startswith("/api/hide"):
+      route = urllib.parse.urlsplit(self.path).path
+      if route != "/api/hide":
         self.send_error(404)
         return
+      if not self._authorized():
+        return
+      origin = self.headers.get("Origin")
+      if origin is not None:
+        origin_host = urllib.parse.urlsplit(origin).netloc.lower()
+        host_hdr = (self.headers.get("Host") or "").strip().lower()
+        if not origin_host or not host_hdr or origin_host != host_hdr:
+          self.send_error(403)
+          return
+      ctype = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+      if ctype != "application/json":
+        self.send_error(415)
+        return
+      raw_len = self.headers.get("Content-Length")
+      if raw_len is None:
+        self.send_error(400)
+        return
       try:
-        length = int(self.headers.get("Content-Length") or 0)
+        length = int(raw_len)
+      except ValueError:
+        self.send_error(400)
+        return
+      if length < 0:
+        self.send_error(400)
+        return
+      if length > 65536:
+        self.send_error(413)
+        return
+      try:
         body = json.loads(self.rfile.read(length) or b"{}")
-      except (ValueError, json.JSONDecodeError):
+      except (ValueError, json.JSONDecodeError, UnicodeDecodeError):
+        self.send_error(400)
+        return
+      if not isinstance(body, dict):
         self.send_error(400)
         return
       singles = [str(body.get("short") or "")]
       bulk = body.get("shorts")
+      if bulk is not None and not isinstance(bulk, list):
+        self.send_error(400)
+        return
       if isinstance(bulk, list):
+        if len(bulk) > 100:
+          self.send_error(400)
+          return
         singles += [str(item) for item in bulk]
       targets = list(dict.fromkeys(item.strip() for item in singles if item.strip()))
-      if not targets:
+      if not targets or len(targets) > 100 or any(len(t) > 128 for t in targets):
         self.send_error(400)
         return
       undo = bool(body.get("undo"))
-      hide_sessions(am, targets, str(body.get("why") or "ui"), state=not undo)
-      print(f"{'restore' if undo else 'hide'} {len(targets)} session(s) via dashboard: "
-            f"{','.join(targets)}", file=sys.stderr)
-      # The snapshot TTL is long enough to make the UI feel stale after a
-      # mutation, so drop it under the same lock the GET path uses.
       with state_lock:
+        hide_sessions(am, targets, str(body.get("why") or "ui"), state=not undo)
         DASHBOARD_CACHE["payload"] = None
         DASHBOARD_CACHE["at"] = 0.0
-      out = json.dumps({"ok": True, "hidden": sorted(hidden_state(am))}).encode("utf-8")
+        hidden = sorted(hidden_state(am))
+      print(f"{'restore' if undo else 'hide'} {len(targets)} session(s) via dashboard: "
+            f"{','.join(targets)}", file=sys.stderr)
+      out = json.dumps({"ok": True, "hidden": hidden}).encode("utf-8")
       self.send_response(200)
       self.send_header("Content-Type", "application/json; charset=utf-8")
       self.send_header("Content-Length", str(len(out)))
@@ -2805,6 +3414,7 @@ def cmd_serve(am: Path, cfg: dict, args: argparse.Namespace) -> int:
       return
 
   server = ThreadingHTTPServer((args.host, args.port), Handler)
+  server.daemon_threads = True
   url = f"http://{args.host if args.host != '0.0.0.0' else '127.0.0.1'}:{args.port}/"
   print(f"am dashboard → {url}")
   print(f"store: {am}")
@@ -2847,16 +3457,13 @@ def index_dir(am: Path) -> Path:
 
 def collect_chunks(am: Path, days: float, all_scopes: bool, max_sessions: int,
                    chunk_chars: int = 600, min_chars: int = 24, limit_total: int = 40000) -> list[dict]:
-  """Extract embeddable text spans from the transcripts in scope."""
+  """Extract embeddable text spans fairly across transcripts in scope."""
   cutoff = now().timestamp() - days * 86400.0
   slug = scope_slug(am.parent)
-  chunks: list[dict] = []
 
-  for agent, base, pattern in transcript_sources():
-    if not base.is_dir():
-      continue
+  def iter_agent_chunks(agent: str, base: Path, pattern: str) -> Iterator[dict]:
     candidates: list[tuple[float, Path]] = []
-    for path in base.glob(pattern):
+    for path in _iter_transcript_paths(base, pattern):
       if not all_scopes and not session_in_scope(agent, path, am.parent, slug):
         continue
       try:
@@ -2867,7 +3474,6 @@ def collect_chunks(am: Path, days: float, all_scopes: bool, max_sessions: int,
         continue
       candidates.append((mtime, path))
     candidates.sort(reverse=True)
-
     for _, path in candidates[:max_sessions]:
       lines = read_zstd_lines(path) if path.suffix == ".zstd" else _read_lines(path)
       session = path.parent.name if path.suffix == ".zstd" else path.stem
@@ -2881,16 +3487,27 @@ def collect_chunks(am: Path, days: float, all_scopes: bool, max_sessions: int,
         text = " ".join(record_text(agent, record).split())
         if len(text) < min_chars:
           continue
-        chunks.append({
+        yield {
           "id": f"{path}#{number}",
           "ts": normalize_time(record.get("timestamp") or record.get("time")),
           "agent": agent,
           "session": session,
           "path": str(path),
           "text": text[:chunk_chars],
-        })
+        }
+
+  streams = [iter_agent_chunks(agent, base, pattern) for agent, base, pattern in transcript_sources()]
+  chunks: list[dict] = []
+  while streams and len(chunks) < limit_total:
+    next_streams: list[Iterator[dict]] = []
+    for stream in streams:
+      item = next(stream, None)
+      if item is not None:
+        chunks.append(item)
+        next_streams.append(stream)
         if len(chunks) >= limit_total:
-          return chunks
+          break
+    streams = next_streams
   return chunks
 
 
@@ -2900,27 +3517,40 @@ def cmd_embed(am: Path, cfg: dict, args: argparse.Namespace) -> int:
   if not chunks:
     die("no embeddable text found in scope; widen with --days or --all")
   directory = index_dir(am)
-  directory.mkdir(parents=True, exist_ok=True)
-  chunk_file = directory / "chunks.jsonl"
-  with chunk_file.open("w", encoding="utf-8") as handle:
-    for chunk in chunks:
-      handle.write(json.dumps(chunk, ensure_ascii=False, sort_keys=True) + "\n")
-
+  directory.parent.mkdir(parents=True, exist_ok=True)
   script = embedder_script(am)
   interpreter = embedder_python()
   print(f"embedding {len(chunks)} chunks via {interpreter}", file=sys.stderr)
-  done = subprocess.run(
-    [interpreter, str(script), "--model", args.model, "index", "--idx", str(directory),
-     "--chunks", str(chunk_file), "--batch", str(args.batch)],
-    capture_output=True, text=True, check=False,
-  )
-  if done.returncode != 0:
-    print(done.stderr.strip(), file=sys.stderr)
-    die("embedding failed; see the message above")
-  meta = load_json(directory / "meta.json", {})
-  meta["window_days"] = args.days
-  meta["chunk_chars"] = args.chunk_chars
-  save_json(directory / "meta.json", meta)
+  staging = Path(tempfile.mkdtemp(prefix=".idx-staging-", dir=str(am)))
+  try:
+    chunk_file = staging / "chunks.jsonl"
+    atomic_write_text(chunk_file, "".join(json.dumps(chunk, ensure_ascii=False, sort_keys=True) + "\n" for chunk in chunks))
+    done = subprocess.run(
+      [interpreter, str(script), "--model", args.model, "index", "--idx", str(staging),
+       "--chunks", str(chunk_file), "--batch", str(args.batch)],
+      capture_output=True, text=True, check=False,
+    )
+    if done.returncode != 0:
+      print(done.stderr.strip(), file=sys.stderr)
+      die("embedding failed; see the message above")
+    meta = load_json(staging / "meta.json", {})
+    meta["window_days"] = args.days
+    meta["chunk_chars"] = args.chunk_chars
+    save_json(staging / "meta.json", meta)
+    backup = am / f".idx-old-{os.getpid()}-{time.monotonic_ns()}"
+    if directory.exists():
+      os.replace(directory, backup)
+    try:
+      os.replace(staging, directory)
+    except BaseException:
+      if backup.exists() and not directory.exists():
+        os.replace(backup, directory)
+      raise
+    if backup.exists():
+      shutil.rmtree(backup, ignore_errors=True)
+  finally:
+    if staging.exists():
+      shutil.rmtree(staging, ignore_errors=True)
   print(f"index ready: {meta.get('count', '?')} vectors × {meta.get('dim', '?')} dims "
         f"({meta.get('model', '?')}) in {directory}")
   if done.stderr.strip():
@@ -2988,12 +3618,14 @@ def task_table(am: Path, tasks: list[dict]) -> list[str]:
   for item in tasks:
     lease = read_lease(am, item["id"])
     if lease and lease.get("live"):
-      tag = str(lease.get("session") or "")[:8]
+      raw_sid = str(lease.get("session") or "")
+      lease_agent = str(lease.get("agent") or "?")
+      tag = short_session(lease_agent, raw_sid)[:8] if raw_sid else ""
       quiet = lease.get("last_seen_min")
       flag = ""
       if quiet is not None:
         flag = f" quiet{quiet}m" + ("!" if lease.get("idle") else "")
-      lease_cell = f"{lease.get('agent', '?')}" + (f":{tag}" if tag else "") + f" {lease.get('remaining_min', 0)}m{flag}"
+      lease_cell = f"{lease_agent}" + (f":{tag}" if tag else "") + f" {lease.get('remaining_min', 0)}m{flag}"
     elif item.get("status") in {"done", "cancelled"}:
       lease_cell = "-"
     else:
@@ -3066,7 +3698,9 @@ def render_overview(am: Path, cfg: dict, agent: str, tasks: list[dict]) -> str:
   out.append("|---|---|---|---|---|---|")
   for item in ranked:
     lease = read_lease(am, item["id"]) or {}
-    session = str(lease.get("session") or "-")[:13]
+    raw_sid = str(lease.get("session") or "")
+    lease_agent = str(lease.get("agent") or item.get("owner") or "")
+    session = short_session(lease_agent, raw_sid) if raw_sid else "-"
     quiet = lease.get("last_seen_min")
     quiet_cell = "?" if quiet is None else (f"**{quiet}m**" if lease.get("idle") else f"{quiet}m")
     stamp = latest.get(item["id"], {}).get("ts", "")
@@ -3082,7 +3716,7 @@ def render_overview(am: Path, cfg: dict, agent: str, tasks: list[dict]) -> str:
 def write_state(am: Path, cfg: dict) -> Path:
   """Rewrite ``state.md`` and return its path."""
   path = am / "state.md"
-  path.write_text(render_state(am, cfg), encoding="utf-8")
+  atomic_write_text(path, render_state(am, cfg))
   return path
 
 
@@ -3116,11 +3750,12 @@ def render_brief(am: Path, cfg: dict, agent: str, budget_tokens: int, events: li
     if lease and lease.get("live"):
       holder = lease.get("agent")
       session = str(lease.get("session") or "")
+      shown_sid = short_session(str(holder or ""), session) if session else ""
       quiet = lease.get("last_seen_min")
       seen = ""
       if quiet is not None:
         seen = T("b.seen_dead" if lease.get("idle") else "b.seen", m=quiet)
-      out.append(T("b.lease", agent=holder, session=(f" / `{session[:13]}`" if session else ""),
+      out.append(T("b.lease", agent=holder, session=(f" / `{shown_sid}`" if shown_sid else ""),
                    minutes=lease.get("remaining_min"), seen=seen))
       # `caller_id` is who is rendering; without it this branch crashed whenever
       # the reader was also the lease holder, because it reached for `args`.
@@ -3242,50 +3877,60 @@ def bundled_doc(name: str) -> str:
 
 def cmd_init(am: Path, cfg: dict, args: argparse.Namespace) -> int:
   """Create the store tree, config, and ignore rules."""
-  if (am / "config.json").exists() and not getattr(args, "force", False):
-    # Re-initialising an existing store used to rewrite its config and DESIGN.md
-    # in place, silently renaming the project for anyone who ran it from the
-    # wrong directory.
-    print(T("c.exists", v=am))
+  with store_lock(am):
+    if (am / "config.json").exists() and not getattr(args, "force", False):
+      # Re-initialising an existing store used to rewrite its config and DESIGN.md
+      # in place, silently renaming the project for anyone who ran it from the
+      # wrong directory.
+      print(T("c.exists", v=am))
+      return 0
+    for sub in ("journal", "tasks", "leases", "briefs"):
+      (am / sub).mkdir(parents=True, exist_ok=True)
+    save_json(am / "config.json", cfg)
+    write_state(am, cfg)
+    print(f"initialised {am}")
+    doc = bundled_doc("DESIGN.md")
+    if doc:
+      atomic_write_text(am / "DESIGN.md", doc)
+    if args.link:
+      atomic_write_text(Path.home() / ".am-root", str(am.resolve()) + "\n")
+    print(T("c.init_next", v=am))
     return 0
-  for sub in ("journal", "tasks", "leases", "briefs"):
-    (am / sub).mkdir(parents=True, exist_ok=True)
-  save_json(am / "config.json", cfg)
-  write_state(am, cfg)
-  print(f"initialised {am}")
-  doc = bundled_doc("DESIGN.md")
-  if doc:
-    (am / "DESIGN.md").write_text(doc, encoding="utf-8")
-  if args.link:
-    (Path.home() / ".am-root").write_text(str(am.resolve()) + "\n", encoding="utf-8")
-  print(T("c.init_next", v=am))
-  return 0
 
 
 def cmd_goal(am: Path, cfg: dict, args: argparse.Namespace) -> int:
   """Record the project goal."""
-  event = base_event(args, "goal", args.text)
-  append_event(am, event)
-  write_state(am, cfg)
+  session_id = caller_session(args)["id"]
+  with store_lock(am):
+    event = base_event(args, "goal", args.text, session_id=session_id)
+    append_event(am, event)
+    write_state(am, cfg)
   print(T("c.goal", v=args.text))
   return 0
 
 
 def cmd_task(am: Path, cfg: dict, args: argparse.Namespace) -> int:
-  """Create or update a task record."""
+  """Create, cancel, or list task records."""
   if args.action == "add":
+    if not args.id:
+      die("task id required")
     if not args.accept:
       die(T("e.needs_accept"))
-    existing = get_task(am, args.id, required=False)
-    record = existing or {"id": slug(args.id), "created": iso(now()), "status": "open", "owner": None}
-    record.update({"title": args.title or record.get("title", ""), "accept": args.accept, "spec": args.spec or record.get("spec", "")})
-    if record.get("status") in {None, ""}:
-      record["status"] = "open"
-    save_task(am, record)
-    append_event(am, base_event(args, "task", f"task `{record['id']}`: {record.get('title', '')}", task=record["id"]))
-    write_state(am, cfg)
+    session_id = caller_session(args)["id"]
+    with store_lock(am):
+      existing = get_task(am, args.id, required=False)
+      record = existing or {"id": slug(args.id), "created": iso(now()), "status": "open", "owner": None}
+      record.update({"title": args.title or record.get("title", ""), "accept": args.accept, "spec": args.spec or record.get("spec", "")})
+      if record.get("status") in {None, ""}:
+        record["status"] = "open"
+      save_task(am, record)
+      append_event(am, base_event(args, "task", f"task `{record['id']}`: {record.get('title', '')}",
+                                  task=record["id"], session_id=session_id))
+      write_state(am, cfg)
     print(f"task {record['id']} saved ({record['status']})")
     return 0
+  if args.action == "cancel":
+    return cmd_cancel(am, cfg, args)
   if args.action == "list":
     items = load_tasks(am)
     if not getattr(args, "all", False):
@@ -3296,17 +3941,44 @@ def cmd_task(am: Path, cfg: dict, args: argparse.Namespace) -> int:
   return 2
 
 
+def renew_lease(am: Path, cfg: dict, task_id: str | None, agent: str, session_id: str = "") -> None:
+  """Extend an active task's lease TTL when the acting agent still owns it.
+
+  Args:
+    am: Path to the ``.agents`` store directory.
+    cfg: Store configuration dictionary.
+    task_id: Optional task identifier.
+    agent: Normalized acting agent name.
+    session_id: Caller session identifier, if known.
+  """
+  if not task_id:
+    return
+  path = lease_path(am, task_id)
+  lease = load_json(path, None)
+  if not isinstance(lease, dict) or lease.get("agent") != agent:
+    return
+  if lease.get("session") and session_id and lease.get("session") != session_id:
+    return
+  minutes = int(cfg.get("lease_minutes") or LEASE_DEFAULT_MIN)
+  lease["expires"] = iso(now() + timedelta(minutes=minutes))
+  save_json(path, lease)
+
+
 def cmd_log(am: Path, cfg: dict, args: argparse.Namespace) -> int:
   """Append a free-form typed event."""
   if args.type not in EVENT_TYPES:
     die(T("e.unknown_type", v=args.type, known=", ".join(EVENT_TYPES)))
-  event = base_event(args, args.type, args.summary, task=args.task or current_task_id(am, args))
-  if args.evidence:
-    event["evidence"] = args.evidence
-  if args.commit:
-    event["commit"] = args.commit
-  append_event(am, event)
-  write_state(am, cfg)
+  session_id = caller_session(args)["id"]
+  with store_lock(am):
+    event = base_event(args, args.type, args.summary, task=args.task or current_task_id(am, args),
+                       session_id=session_id)
+    if args.evidence:
+      event["evidence"] = args.evidence
+    if args.commit:
+      event["commit"] = args.commit
+    append_event(am, event)
+    renew_lease(am, cfg, event.get("task"), args.agent, session_id)
+    write_state(am, cfg)
   print(f"logged {args.type} → {event['task'] or '(no task)'}")
   return 0
 
@@ -3321,56 +3993,69 @@ def current_task_id(am: Path, args: argparse.Namespace) -> str | None:
 
 def cmd_next(am: Path, cfg: dict, args: argparse.Namespace) -> int:
   """Record the exact next command for the task, so handoff is mechanical."""
-  task_id = args.task or current_task_id(am, args)
-  if not task_id:
-    die(T("e.needs_next_task"))
-  record = get_task(am, task_id)
-  assert record is not None
-  record["next"] = args.command
-  save_task(am, record)
-  event = base_event(args, "next", args.command, task=task_id)
-  append_event(am, event)
-  write_state(am, cfg)
+  session_id = caller_session(args)["id"]
+  with store_lock(am):
+    task_id = args.task or current_task_id(am, args)
+    if not task_id:
+      die(T("e.needs_next_task"))
+    record = get_task(am, task_id)
+    assert record is not None
+    record["next"] = args.command
+    save_task(am, record)
+    event = base_event(args, "next", args.command, task=task_id, session_id=session_id)
+    append_event(am, event)
+    renew_lease(am, cfg, task_id, args.agent, session_id)
+    write_state(am, cfg)
   print(T("c.next", id=task_id))
   return 0
 
 
 def cmd_claim(am: Path, cfg: dict, args: argparse.Namespace) -> int:
   """Take a TTL lease on a task so two live agents cannot fight over it."""
-  record = get_task(am, args.id)
-  assert record is not None
-  return claim_record(am, cfg, args, record)
-
-
-def claim_record(am: Path, cfg: dict, args: argparse.Namespace, record: dict) -> int:
-  """Lease an existing task record to the calling session."""
-  if record.get("status") == "done":
-    die(T("e.already_done", id=record["id"]))
   session = caller_session(args)
-  lease = read_lease(am, record["id"])
-  mine = bool(lease) and lease.get("agent") == args.agent
-  if mine and lease.get("session") and session["id"]:
-    mine = lease["session"] == session["id"]
-  if lease and lease.get("live") and not mine and not args.force:
-    holder = lease.get("session") or "(unknown session)"
-    idle = lease.get("last_seen_min")
-    seen = T("b.seen", m=idle) if idle is not None else ""
-    die(T("e.lease_held", id=record["id"], agent=lease.get("agent"),
-          session=holder, seen=seen, m=lease.get("remaining_min")))
-  minutes = args.ttl or cfg["lease_minutes"]
-  expires = now() + timedelta(minutes=minutes)
-  save_json(lease_path(am, record["id"]), {
-    "agent": args.agent,
-    "session": session["id"],
-    "session_path": session["path"],
-    "session_source": session["source"],
-    "expires": iso(expires),
-  })
-  record["status"] = "claimed" if record.get("status") in {"open", "blocked"} else record.get("status")
-  record["owner"] = args.agent
-  save_task(am, record)
-  append_event(am, base_event(args, "claim", f"claimed for {minutes}m", task=record["id"]))
-  write_state(am, cfg)
+  with store_lock(am):
+    record = get_task(am, args.id)
+    assert record is not None
+    return claim_record(am, cfg, args, record, session=session)
+
+
+def claim_record(am: Path, cfg: dict, args: argparse.Namespace, record: dict,
+                 session: dict | None = None) -> int:
+  """Lease an existing task record to the calling session."""
+  session = session or caller_session(args)
+  with store_lock(am):
+    fresh = get_task(am, record["id"], required=False)
+    if fresh is not None:
+      record = fresh
+    if record.get("status") == "done":
+      die(T("e.already_done", id=record["id"]))
+    if record.get("status") == "cancelled":
+      die(f"task '{record['id']}' is cancelled")
+    lease = read_lease(am, record["id"])
+    mine = bool(lease) and lease.get("agent") == args.agent
+    if mine and lease.get("session") and session["id"]:
+      mine = lease["session"] == session["id"]
+    if lease and lease.get("live") and not mine and not args.force:
+      holder = lease.get("session") or "(unknown session)"
+      idle = lease.get("last_seen_min")
+      seen = T("b.seen", m=idle) if idle is not None else ""
+      die(T("e.lease_held", id=record["id"], agent=lease.get("agent"),
+            session=holder, seen=seen, m=lease.get("remaining_min")))
+    minutes = args.ttl or cfg["lease_minutes"]
+    expires = now() + timedelta(minutes=minutes)
+    save_json(lease_path(am, record["id"]), {
+      "agent": args.agent,
+      "session": session["id"],
+      "session_path": session["path"],
+      "session_source": session["source"],
+      "expires": iso(expires),
+    })
+    record["status"] = "claimed" if record.get("status") in {"open", "blocked"} else record.get("status")
+    record["owner"] = args.agent
+    save_task(am, record)
+    append_event(am, base_event(args, "claim", f"claimed for {minutes}m",
+                                task=record["id"], session_id=session["id"]))
+    write_state(am, cfg)
   print(T("c.claimed", id=record["id"], agent=args.agent, m=minutes))
   return 0
 
@@ -3385,70 +4070,105 @@ def cmd_start(am: Path, cfg: dict, args: argparse.Namespace) -> int:
   task_id = slug(args.id)
   if not task_id or task_id == "unknown":
     die(T("e.bad_task_id", v=args.id))
-  record = get_task(am, task_id, required=False)
-  if record is None:
-    record = {
-      "id": task_id, "created": iso(now()), "status": "open", "owner": None,
-      "title": args.title or task_id, "accept": args.accept or "", "spec": args.spec or "",
-    }
-    save_task(am, record)
-    append_event(am, base_event(args, "task", f"task `{task_id}`: {record['title']}", task=task_id))
-    print(T("c.started_new", id=task_id, title=record["title"]))
-  else:
-    if record.get("status") == "done":
-      die(T("e.already_done", id=task_id))
-    print(T("c.started_existing", id=task_id))
-  return claim_record(am, cfg, args, record)
+  session = caller_session(args)
+  with store_lock(am):
+    record = get_task(am, task_id, required=False)
+    if record is None:
+      record = {
+        "id": task_id, "created": iso(now()), "status": "open", "owner": None,
+        "title": args.title or task_id, "accept": args.accept or "", "spec": args.spec or "",
+      }
+      save_task(am, record)
+      append_event(am, base_event(args, "task", f"task `{task_id}`: {record['title']}",
+                                  task=task_id, session_id=session["id"]))
+      print(T("c.started_new", id=task_id, title=record["title"]))
+    else:
+      if record.get("status") == "done":
+        die(T("e.already_done", id=task_id))
+      if record.get("status") == "cancelled":
+        die(f"task '{task_id}' is cancelled")
+      print(T("c.started_existing", id=task_id))
+    return claim_record(am, cfg, args, record, session=session)
 
 
 def cmd_release(am: Path, cfg: dict, args: argparse.Namespace) -> int:
   """Drop a lease without finishing the task."""
-  record = get_task(am, args.id)
-  assert record is not None
-  lease = read_lease(am, record["id"])
-  if lease and lease.get("agent") != args.agent and not args.force:
-    die(f"lease on '{record['id']}' belongs to {lease.get('agent')}, not {args.agent}")
-  lease_path(am, record["id"]).unlink(missing_ok=True)
-  record["status"] = "open" if record.get("status") == "claimed" else record.get("status")
-  record["owner"] = None
-  save_task(am, record)
-  append_event(am, base_event(args, "claim", "released", task=record["id"]))
-  write_state(am, cfg)
+  session_id = caller_session(args)["id"]
+  with store_lock(am):
+    record = get_task(am, args.id)
+    assert record is not None
+    lease = read_lease(am, record["id"])
+    if lease and lease.get("agent") != args.agent and not args.force:
+      die(f"lease on '{record['id']}' belongs to {lease.get('agent')}, not {args.agent}")
+    lease_path(am, record["id"]).unlink(missing_ok=True)
+    record["status"] = "open" if record.get("status") == "claimed" else record.get("status")
+    record["owner"] = None
+    save_task(am, record)
+    append_event(am, base_event(args, "claim", "released", task=record["id"], session_id=session_id))
+    write_state(am, cfg)
   print(T("c.released", id=record["id"]))
   return 0
 
 
 def cmd_done(am: Path, cfg: dict, args: argparse.Namespace) -> int:
   """Close a task and require evidence."""
-  record = get_task(am, args.id)
-  assert record is not None
   if not args.evidence:
     die(T("e.needs_evidence"))
-  record["status"] = "done"
-  record["evidence"] = args.evidence
-  record["commit"] = args.commit or record.get("commit", "")
-  save_task(am, record)
-  lease_path(am, record["id"]).unlink(missing_ok=True)
-  event = base_event(args, "done", f"done: {args.evidence}", task=record["id"])
-  if args.commit:
-    event["commit"] = args.commit
-  append_event(am, event)
-  write_state(am, cfg)
+  session_id = caller_session(args)["id"]
+  with store_lock(am):
+    record = get_task(am, args.id)
+    assert record is not None
+    record["status"] = "done"
+    record["evidence"] = args.evidence
+    record["commit"] = args.commit or record.get("commit", "")
+    save_task(am, record)
+    lease_path(am, record["id"]).unlink(missing_ok=True)
+    event = base_event(args, "done", f"done: {args.evidence}", task=record["id"], session_id=session_id)
+    if args.commit:
+      event["commit"] = args.commit
+    append_event(am, event)
+    write_state(am, cfg)
   print(T("c.done", id=record["id"]))
   return 0
 
 
 def cmd_block(am: Path, cfg: dict, args: argparse.Namespace) -> int:
   """Mark a task blocked with the concrete reason."""
-  record = get_task(am, args.id)
-  assert record is not None
-  record["status"] = "blocked"
-  record["blocked_reason"] = args.reason
-  save_task(am, record)
-  lease_path(am, record["id"]).unlink(missing_ok=True)
-  append_event(am, base_event(args, "blocker", args.reason, task=record["id"]))
-  write_state(am, cfg)
+  session_id = caller_session(args)["id"]
+  with store_lock(am):
+    record = get_task(am, args.id)
+    assert record is not None
+    record["status"] = "blocked"
+    record["blocked_reason"] = args.reason
+    save_task(am, record)
+    lease_path(am, record["id"]).unlink(missing_ok=True)
+    append_event(am, base_event(args, "blocker", args.reason, task=record["id"], session_id=session_id))
+    write_state(am, cfg)
   print(T("c.blocked", id=record["id"]))
+  return 0
+
+
+def cmd_cancel(am: Path, cfg: dict, args: argparse.Namespace) -> int:
+  """Cancel an open, claimed, or blocked task cleanly."""
+  if not getattr(args, "id", None):
+    die("task id required")
+  session_id = caller_session(args)["id"]
+  with store_lock(am):
+    record = get_task(am, args.id)
+    assert record is not None
+    if record.get("status") == "done":
+      die(T("e.already_done", id=record["id"]))
+    record["status"] = "cancelled"
+    reason = (getattr(args, "reason", None) or "").strip()
+    if reason:
+      record["cancelled_reason"] = reason
+    record["owner"] = None
+    save_task(am, record)
+    lease_path(am, record["id"]).unlink(missing_ok=True)
+    summary = f"cancelled: {reason}" if reason else "cancelled"
+    append_event(am, base_event(args, "note", summary, task=record["id"], session_id=session_id))
+    write_state(am, cfg)
+  print(T("c.cancelled", id=record["id"]))
   return 0
 
 
@@ -3532,7 +4252,6 @@ def cmd_delegate(am: Path, cfg: dict, args: argparse.Namespace) -> int:
   if args.action == "report":
     print(json.dumps(delegate_packets(am, args.task or ""), ensure_ascii=False))
     return 0
-  import fcntl
   raw = sys.stdin.read(1_000_001)
   if len(raw) > 1_000_000:
     die("Delegate handoff exceeds size limit")
@@ -3557,11 +4276,15 @@ def cmd_delegate(am: Path, cfg: dict, args: argparse.Namespace) -> int:
     key = packet["source_id"]
     path = directory / (key + ".json")
     previous = load_json(path, {})
+    if not isinstance(previous, dict):
+      previous = {}
     if previous.get("revision", 0) == packet["revision"] and previous != packet:
       die("Conflicting delegate revision")
     if previous.get("revision", 0) < packet["revision"]:
       save_json(path, packet)
     ids = load_json(directory / "index.json", [])
+    if not isinstance(ids, list):
+      ids = []
     if key not in ids:
       save_json(directory / "index.json", ids + [key])
   print(json.dumps({"source_id": key, "revision": max(packet["revision"], previous.get("revision", 0)),
@@ -3576,7 +4299,9 @@ def cmd_brief(am: Path, cfg: dict, args: argparse.Namespace) -> int:
     watch_scan(am)
   inflight = [item for item in load_tasks(am) if item.get("status") in {"open", "claimed", "blocked"}]
   if args.task:
-    target_id = slug(args.task)
+    task = get_task(am, args.task)
+    assert task is not None
+    target_id = task["id"]
   elif not inflight:
     # Nothing registered. Rather than a dead end, show what the agents are
     # actually doing — that is the question the caller is really asking.
@@ -3597,8 +4322,7 @@ def cmd_brief(am: Path, cfg: dict, args: argparse.Namespace) -> int:
   text += "\n" + "\n".join(render_sessions(recent_sessions(am, 7.0, 3)))
   if args.save:
     path = am / "briefs" / f"{now().strftime('%Y%m%dT%H%M%S')}-{agent}.md"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
+    atomic_write_text(path, text)
     print(f"# saved {path}", file=sys.stderr)
   print(text)
   return 0
@@ -3748,11 +4472,13 @@ def cmd_prune(am: Path, cfg: dict, args: argparse.Namespace) -> int:
 
   for path in sorted((am / "tasks").glob("*.json")):
     record = load_json(path, {})
-    if not isinstance(record, dict) or record.get("status") != "done":
+    if not isinstance(record, dict) or record.get("status") not in {"done", "cancelled"}:
       continue
     stamp = str(record.get("updated") or record.get("created") or "")
     try:
-      settled = datetime.fromisoformat(stamp)
+      settled = datetime.fromisoformat(stamp[:-1] + "+00:00" if stamp.endswith("Z") else stamp)
+      if settled.tzinfo is None:
+        settled = settled.astimezone()
     except ValueError:
       continue
     if settled < cutoff:
@@ -3795,7 +4521,7 @@ def cmd_prune(am: Path, cfg: dict, args: argparse.Namespace) -> int:
     print(T("p.nothing"))
     return 0
   for path, record, month in tasks:
-    print("  " + T("p.item", label=f"task {record.get('id')} (done {month})"))
+    print("  " + T("p.item", label=f"task {record.get('id')} ({record.get('status')} {month})"))
   for path in journals:
     print("  " + T("p.item", label=f"journal {path.name}"))
   for path in briefs:
@@ -3808,23 +4534,28 @@ def cmd_prune(am: Path, cfg: dict, args: argparse.Namespace) -> int:
     print("\n" + T("p.dry"))
     return 0
 
-  for path, record, month in tasks:
-    append_gz(archive / "tasks" / f"tasks-{month}.jsonl.gz",
-              [json.dumps(record, ensure_ascii=False, sort_keys=True)])
-    path.unlink(missing_ok=True)
-  for path in journals:
-    append_gz(archive / "journal" / f"{path.stem}.jsonl.gz",
-              [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()])
-    path.unlink(missing_ok=True)
-  for row in empty_sessions:
-    hide_session(am, row["short"], "empty")
-  for path in briefs:
-    target = archive / "briefs" / path.name
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
-    path.unlink(missing_ok=True)
+  with store_lock(am):
+    for path, record, month in tasks:
+      append_gz(archive / "tasks" / f"tasks-{month}.jsonl.gz",
+                [json.dumps(record, ensure_ascii=False, sort_keys=True)])
+      path.unlink(missing_ok=True)
+      tid = str(record.get("id") or "")
+      if tid:
+        lease_path(am, tid).unlink(missing_ok=True)
+        if re.fullmatch(r"[A-Za-z0-9_-]{1,100}", tid):
+          shutil.rmtree(am / "integrations" / "delegate" / tid, ignore_errors=True)
+    for path in journals:
+      append_gz(archive / "journal" / f"{path.stem}.jsonl.gz",
+                [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()])
+      path.unlink(missing_ok=True)
+    for row in empty_sessions:
+      hide_session(am, row["short"], "empty")
+    for path in briefs:
+      target = archive / "briefs" / path.name
+      atomic_write_text(target, path.read_text(encoding="utf-8"))
+      path.unlink(missing_ok=True)
 
-  write_state(am, cfg)
+    write_state(am, cfg)
   print("\n" + T("p.done", n=total, at=archive))
   return 0
 
@@ -3845,6 +4576,22 @@ def cmd_doctor(am: Path, cfg: dict, args: argparse.Namespace) -> int:
   """Check that the store is consistent enough for another agent to take over."""
   problems: list[str] = []
   warnings: list[str] = []
+
+  json_targets: list[Path] = []
+  for fixed in (am / "config.json", am / "hidden.json", am / ".watch.json", am / "idx" / "meta.json"):
+    if fixed.exists():
+      json_targets.append(fixed)
+  for sub_dir in ("tasks", "leases"):
+    if (am / sub_dir).is_dir():
+      json_targets.extend(sorted((am / sub_dir).glob("*.json")))
+  for path in json_targets:
+    try:
+      data = load_json(path, {}, strict=True)
+      if not isinstance(data, dict):
+        problems.append(f"corrupt JSON in {path.relative_to(am)}: expected object")
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+      problems.append(f"corrupt JSON in {path.relative_to(am)}: {exc}")
+
   tasks = load_tasks(am)
   events = load_events(am)
 
@@ -3860,7 +4607,7 @@ def cmd_doctor(am: Path, cfg: dict, args: argparse.Namespace) -> int:
     if item.get("status") in {"done", "cancelled"}:
       continue
     if not item.get("accept"):
-      problems.append(f"task `{item['id']}` has no acceptance criterion")
+      warnings.append(f"task `{item['id']}` has no acceptance criterion")
     if item.get("status") == "blocked" and not item.get("blocked_reason"):
       problems.append(f"task `{item['id']}` is blocked without a reason")
     lease = read_lease(am, item["id"])
@@ -3902,11 +4649,16 @@ def cmd_handoff(am: Path, cfg: dict, args: argparse.Namespace) -> int:
   target = slug(args.to)
   if not getattr(args, "no_scan", False):
     watch_scan(am)
+  task_arg = getattr(args, "task", None)
+  target_id = None
+  if task_arg:
+    task = get_task(am, task_arg)
+    assert task is not None
+    target_id = task["id"]
   text = render_brief(am, cfg, target, args.budget or cfg["brief_tokens"], load_events(am),
-                      None, caller_session(args)["id"])
+                      target_id, caller_session(args)["id"])
   path = am / "briefs" / f"{now().strftime('%Y%m%dT%H%M%S')}-{target}.md"
-  path.parent.mkdir(parents=True, exist_ok=True)
-  path.write_text(text, encoding="utf-8")
+  atomic_write_text(path, text)
   print(text)
   print(file=sys.stderr)
   print(f"# handed off to {target} → {path}", file=sys.stderr)
@@ -3929,7 +4681,8 @@ def caller_session(args: argparse.Namespace) -> dict:
   return current_session(agent)
 
 
-def base_event(args: argparse.Namespace, event_type: str, summary: str, task: str | None = None) -> dict:
+def base_event(args: argparse.Namespace, event_type: str, summary: str, task: str | None = None,
+               session_id: str | None = None) -> dict:
   """Build the common event envelope."""
   event = {
     "ts": iso(now()),
@@ -3939,9 +4692,9 @@ def base_event(args: argparse.Namespace, event_type: str, summary: str, task: st
     "task": task or getattr(args, "task", None),
     "refs": list(getattr(args, "ref", None) or []),
   }
-  session_id = caller_session(args)["id"]
-  if session_id:
-    event["session"] = session_id
+  resolved_session = caller_session(args)["id"] if session_id is None else session_id
+  if resolved_session:
+    event["session"] = resolved_session
   model = getattr(args, "model", None)
   if model:
     event["model"] = model
@@ -3974,12 +4727,13 @@ def build_parser() -> argparse.ArgumentParser:
   p.add_argument("text")
   p.set_defaults(func=cmd_goal)
 
-  p = sub.add_parser("task", help="create or list tasks")
-  p.add_argument("action", choices=("add", "list"))
+  p = sub.add_parser("task", help="create, cancel or list tasks")
+  p.add_argument("action", choices=("add", "cancel", "list"))
   p.add_argument("id", nargs="?")
   p.add_argument("--title")
   p.add_argument("--spec", help="free-form requirements")
   p.add_argument("--accept", help="how we know it is done; required to add")
+  p.add_argument("--reason", help="why the task was cancelled")
   p.add_argument("--all", action="store_true", help="list finished tasks too")
   p.set_defaults(func=cmd_task)
 
@@ -4043,6 +4797,11 @@ def build_parser() -> argparse.ArgumentParser:
   p.add_argument("--reason", required=True)
   p.set_defaults(func=cmd_block)
 
+  p = sub.add_parser("cancel", help="cancel an open, claimed, or blocked task")
+  p.add_argument("id")
+  p.add_argument("--reason", help="why the task was cancelled")
+  p.set_defaults(func=cmd_cancel)
+
   p = sub.add_parser("brief", help="print the resume brief")
   p.add_argument("--for", dest="for_", metavar="AGENT")
   p.add_argument("--task", metavar="ID", help="force the detailed brief for one task")
@@ -4053,6 +4812,7 @@ def build_parser() -> argparse.ArgumentParser:
 
   p = sub.add_parser("handoff", help="produce a brief for the successor agent")
   p.add_argument("--to", required=True, metavar="AGENT")
+  p.add_argument("--task", metavar="ID", help="target task id")
   p.add_argument("--budget", type=int, metavar="TOKENS")
   p.add_argument("--no-scan", action="store_true")
   p.set_defaults(func=cmd_handoff)
@@ -4101,6 +4861,7 @@ def build_parser() -> argparse.ArgumentParser:
   p = sub.add_parser("serve", help="serve the live dashboard in a browser")
   p.add_argument("--port", type=int, default=37778)
   p.add_argument("--host", default="127.0.0.1", help="0.0.0.0 to expose on the LAN")
+  p.add_argument("--token", help="bearer / X-AM-Token auth secret (or $AM_DASHBOARD_TOKEN)")
   p.set_defaults(func=cmd_serve)
 
   p = sub.add_parser("prune", help="archive settled tasks, old briefs and journals")

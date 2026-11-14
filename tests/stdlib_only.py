@@ -16,7 +16,7 @@ import ast
 import pathlib
 import sys
 
-TARGETS = ("bin/am",)
+TARGETS = ("bin/am", "bin/am_work.py")
 
 
 def imported_roots(path: pathlib.Path) -> set[str]:
